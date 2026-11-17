@@ -1,0 +1,40 @@
+{
+  "name": "yuque-export",
+  "version": "2.0.0",
+  "description": "Export a public Yuque (语雀) document to Markdown, Word and PDF with images embedded. No Yuque membership or third-party Yuque SDK required.",
+  "main": "src/client.js",
+  "bin": {
+    "yuque-export": "src/cli.js"
+  },
+  "files": [
+    "src/",
+    "SKILL.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test/smoke.js",
+    "prepublishOnly": "npm test"
+  },
+  "dependencies": {
+    "marked": "^15.0.0",
+    "html-to-docx": "^1.8.0"
+  },
+  "engines": {
+    "node": ">=18.4.0"
+  },
+  "license": "MIT",
+  "keywords": [
+    "yuque", "语雀", "yuque-export", "markdown", "docx", "pdf",
+    "export", "converter", "agent-skill", "claude-skill"
+  ],
+  "author": "Bois",
+  "homepage": "https://github.com/imbois/yuque-export#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/imbois/yuque-export.git"
+  },
+  "bugs": {
+    "url": "https://github.com/imbois/yuque-export/issues"
+  }
+}
