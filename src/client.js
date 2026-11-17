@@ -12,12 +12,39 @@
  */
 
 const { join } = require('path');
-const { ensureDir, writeFile } = require('./fsutil');
+const { createHash } = require('crypto');
+const { ensureDir, writeFile, safeName } = require('./fsutil');
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const HOST = 'https://www.yuque.com';
+
+/** 单张图片体积上限（防止文档里塞超大文件把磁盘/内存打满） */
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+const IMAGE_TIMEOUT = 30000;
+
+/** 严格判断语雀域名：yuque.com 及其子域，拒绝 evilyuque.com 这类伪造 */
+function isYuqueHost(hostname) {
+  const h = String(hostname || '').toLowerCase();
+  return h === 'yuque.com' || h.endsWith('.yuque.com');
+}
+
+/** 内网/回环地址判定：文档内容不可信，避免被用来探测本机与内网 */
+function isPrivateHost(hostname) {
+  const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (h === 'localhost' || h.endsWith('.localhost')) return true;
+  if (/^127\./.test(h) || /^10\./.test(h) || /^192\.168\./.test(h) || /^169\.254\./.test(h)) return true;
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(h)) return true;
+  if (h === '::1' || h === '0.0.0.0') return true;
+  if (/^(fc|fd|fe80)/.test(h)) return true;
+  return false;
+}
+
+/** 测试用途：本地 Mock 服务器需要放行回环地址 */
+function allowPrivate() {
+  return process.env.YUQUE_EXPORT_ALLOW_PRIVATE === '1';
+}
 
 function headers(cookie, referer) {
   const h = { 'user-agent': UA, accept: '*/*' };
@@ -59,7 +86,7 @@ function parseUrl(raw) {
   } catch {
     throw new Error('URL 格式不正确：' + raw);
   }
-  if (!/yuque\.com$/.test(u.hostname)) {
+  if (!isYuqueHost(u.hostname)) {
     throw new Error('仅支持 yuque.com 域名：' + u.hostname);
   }
   const seg = u.pathname.split('/').filter(Boolean);
@@ -71,6 +98,14 @@ function parseUrl(raw) {
     docSlug: seg[2] ? clean(seg[2]) : null,
     canonical: `${HOST}/${seg[0]}/${seg[1]}${seg[2] ? '/' + clean(seg[2]) : ''}`,
   };
+}
+
+/** 构造规范的文档地址（login/book/doc），用作 Referer */
+function docUrl(login, bookSlug, docSlug) {
+  const parts = [login, bookSlug, docSlug]
+    .filter(Boolean)
+    .map((s) => String(s).replace(/^\/+|\/+$/g, ''));
+  return `${HOST}/${parts.join('/')}`;
 }
 
 /** 取页面 appData（含 book / doc 元信息与目录树） */
@@ -127,87 +162,140 @@ function cleanLakeSource(md) {
     .trim();
 }
 
-/** 下载正文中的图片，改写为相对路径（默认 ./img/{docId}/） */
+/** 从 markdown 中收集图片地址（`![](...)` 与 `<img src>`） */
+function collectImageUrls(markdown) {
+  const urls = [];
+  const seen = new Set();
+  const push = (src) => {
+    let u = String(src || '').trim().replace(/^<|>$/g, '');
+    if (u.startsWith('//')) u = 'https:' + u;
+    if (!/^https?:\/\//i.test(u)) return;
+    if (seen.has(u)) return;
+    seen.add(u);
+    urls.push(u);
+  };
+  for (const m of markdown.matchAll(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g)) push(m[2]);
+  for (const m of markdown.matchAll(/<img([^>]*?)src="([^"]+)"([^>]*?)>/gi)) push(m[2]);
+  return urls;
+}
+
+/** 下载单张图片，返回 buffer；失败抛错 */
+async function fetchImage(url, cookie, referer) {
+  const host = new URL(url).hostname;
+  if (isPrivateHost(host) && !allowPrivate()) {
+    throw new Error('拒绝访问内网地址');
+  }
+  const toYuque = isYuqueHost(host);
+  const res = await fetch(url, {
+    // 安全边界：cookie/referer 只发给 yuque.com 系域名，
+    // 防止文档内嵌的第三方图片地址把用户的登录态带出去
+    headers: headers(toYuque ? cookie : null, toYuque ? referer : null),
+    signal: AbortSignal.timeout(IMAGE_TIMEOUT),
+    redirect: 'follow',
+  });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+
+  const len = Number(res.headers.get('content-length') || 0);
+  if (len > MAX_IMAGE_BYTES) throw new Error(`体积超限 ${(len / 1048576).toFixed(1)}MB`);
+  const ct = String(res.headers.get('content-type') || '').toLowerCase();
+  // 常见 CDN 会返回 octet-stream；只要不是明确的 HTML/文本，就按图片处理
+  if (ct && !ct.startsWith('image/') && !ct.startsWith('application/octet-stream')) {
+    throw new Error('非图片类型 ' + ct);
+  }
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (!buf.length) throw new Error('空响应');
+  if (buf.length > MAX_IMAGE_BYTES) throw new Error('体积超限');
+  return buf;
+}
+
+/**
+ * 下载正文图片，并把链接改写为本地相对路径。
+ *
+ * 关键行为：**先下载，成功后才改写链接**。下载失败的图片保留原始 URL，
+ * 保证 Markdown 里不会出现指向不存在文件的死链。
+ */
 async function downloadImages(markdown, docId, referer, cookie, imgRoot) {
-  const seen = new Map();
-  const tasks = [];
-  const targetDir = `${imgRoot}/${docId}`;
+  const dirId = safeName(String(docId || 'doc'), 'doc').slice(0, 64) || 'doc';
+  const targetDir = join(imgRoot, dirId);
+  const relDir = `./img/${dirId}`;
 
-  const collect = (raw) => {
-    let url = raw.trim().replace(/^<|>$/g, '');
-    if (url.startsWith('//')) url = 'https:' + url;
-    if (!/^https?:\/\//i.test(url)) return null;
-    return url;
-  };
+  const urls = collectImageUrls(markdown);
+  if (!urls.length) return { markdown, dir: null, count: 0, failed: [] };
 
-  const rewrite = (url) => {
-    if (!seen.has(url)) {
-      const name = urls2name(url, seen.size);
-      seen.set(url, name);
-      tasks.push({ url, name });
-    }
-    return `./img/${docId}/${seen.get(url)}`;
-  };
-
-  let out = markdown.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (m, alt, src) => {
-    const u = collect(src);
-    if (!u) return m;
-    return `![${alt}](${rewrite(u)})`;
+  // 文件名带 URL 短哈希，避免不同 CDN 的同名图片互相覆盖
+  const nameOf = new Map();
+  const used = new Set();
+  urls.forEach((u, i) => {
+    let name = urls2name(u, i);
+    if (used.has(name)) name = name.replace(/(\.[^.]+)$/, `-${i}$1`);
+    used.add(name);
+    nameOf.set(u, name);
   });
-  out = out.replace(/<img([^>]*?)src="([^"]+)"([^>]*?)>/gi, (m, pre, src, post) => {
-    const u = collect(src);
-    if (!u) return m;
-    return `<img${pre}src="${rewrite(u)}"${post}>`;
-  });
-
-  if (!tasks.length) return { markdown: out, dir: null, count: 0, failed: [] };
 
   const failed = [];
-  const limit = 4;
+  const okUrls = new Set();
   let cursor = 0;
   async function worker() {
-    while (cursor < tasks.length) {
-      const t = tasks[cursor++];
+    while (cursor < urls.length) {
+      const url = urls[cursor++];
       try {
-        // 安全边界：cookie/referer 只发给 yuque.com 系域名，
-        // 防止文档内嵌的第三方图片地址把用户的登录态带出去
-        const toYuque = /^https?:\/\/([^/]+\.)?yuque\.com\//i.test(t.url);
-        const res = await fetch(t.url, {
-          headers: headers(toYuque ? cookie : null, toYuque ? referer : null),
-          signal: AbortSignal.timeout(30000),
-        });
-        if (!res.ok) throw new Error(String(res.status));
-        const buf = Buffer.from(await res.arrayBuffer());
+        const buf = await fetchImage(url, cookie, referer);
         await ensureDir(targetDir);
-        await writeFile(join(targetDir, t.name), buf);
+        await writeFile(join(targetDir, nameOf.get(url)), buf);
+        okUrls.add(url);
       } catch (e) {
-        failed.push(`${t.url} (${e.message})`);
+        failed.push(`${url} (${e.message})`);
       }
     }
   }
-  await Promise.all(Array.from({ length: limit }, worker));
+  await Promise.all(Array.from({ length: 4 }, worker));
 
-  return { markdown: out, dir: targetDir, count: tasks.length - failed.length, failed };
+  const key = (src) => {
+    const u = String(src).trim().replace(/^<|>$/g, '');
+    return u.startsWith('//') ? 'https:' + u : u;
+  };
+  const rel = (u) => `${relDir}/${nameOf.get(u)}`;
+
+  let out = markdown.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (m, alt, src) => {
+    const u = key(src);
+    return okUrls.has(u) ? `![${alt}](${rel(u)})` : m;
+  });
+  out = out.replace(/<img([^>]*?)src="([^"]+)"([^>]*?)>/gi, (m, pre, src, post) => {
+    const u = key(src);
+    return okUrls.has(u) ? `<img${pre}src="${rel(u)}"${post}>` : m;
+  });
+
+  return { markdown: out, dir: targetDir, count: okUrls.size, failed };
 }
 
+/** 由 URL 生成安全、可读、唯一的文件名 */
 function urls2name(url, idx) {
+  let base = `image-${idx}`;
   try {
     const p = new URL(url).pathname;
-    let base = decodeURIComponent(p.split('/').pop() || '');
-    base = base.replace(/[\\/:*?"<>|]/g, '_');
-    if (!base || base.length > 80) base = `image-${idx}`;
-    if (!/\.[a-z0-9]{2,5}$/i.test(base)) base += '.png';
-    // Windows 保留设备名（con/aux/nul/com1...）无法作为文件名
-    if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/i.test(base)) base = '_' + base;
-    return base;
+    base = decodeURIComponent(p.split('/').pop() || '') || base;
   } catch {
-    return `image-${idx}.png`;
+    /* 落到默认名 */
   }
+  base = base.replace(/[\\/:*?"<>|]/g, '_').replace(/^\.+/, '');
+  if (base.length > 60) base = base.slice(0, 60);
+  if (!/\.[a-z0-9]{2,5}$/i.test(base)) base += '.png';
+  const ext = /(\.[^.]+)$/.exec(base)[0];
+  let stem = base.slice(0, base.length - ext.length) || 'image';
+  // Windows 保留设备名（CON/NUL/COM1...）不能作为文件名，加下划线规避
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(stem)) stem = '_' + stem;
+  // 短哈希：同一目录下不同来源的同名图片不会互相覆盖
+  const hash = createHash('sha256').update(url).digest('hex').slice(0, 8);
+  return `${stem}-${hash}${ext}`;
 }
 
 module.exports = {
   HOST,
   parseUrl,
+  docUrl,
+  isYuqueHost,
+  isPrivateHost,
+  collectImageUrls,
   fetchContext,
   fetchDocBody,
   cleanLakeSource,

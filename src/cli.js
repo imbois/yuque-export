@@ -11,7 +11,7 @@ const fs = require('fs');
 const path = require('path');
 const { ensureDir, safeName, uniquePath } = require('./fsutil');
 const {
-  parseUrl, fetchContext, fetchDocBody, cleanLakeSource, downloadImages,
+  HOST, parseUrl, docUrl, fetchContext, fetchDocBody, cleanLakeSource, downloadImages,
 } = require('./client');
 const { markdownToHtml, htmlToDocx, htmlToPdf } = require('./convert');
 
@@ -35,7 +35,7 @@ function assertNode() {
 function parseArgs(argv) {
   const o = {
     out: 'output', pdf: false, keepHtml: false, token: null, url: null,
-    book: false, limit: 0, mdOnly: false,
+    book: false, limitRaw: null, mdOnly: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -47,9 +47,11 @@ function parseArgs(argv) {
     else if (a === '-t' || a === '--token') o.token = argv[++i];
     else if (a === '--book') o.book = true;
     else if (a === '--md-only') o.mdOnly = true;
-    else if (a === '--limit') o.limit = parseInt(argv[++i], 10) || 0;
+    else if (a === '--limit') o.limitRaw = argv[++i];
     else if (!a.startsWith('-')) o.url = a;
   }
+  // cookie 也可以从环境变量读，避免出现在 shell 历史和进程列表里
+  if (!o.token && process.env.YUQUE_COOKIE) o.token = process.env.YUQUE_COOKIE;
   return o;
 }
 
@@ -68,8 +70,9 @@ yuque-export v${VERSION} —— 语雀公开文档导出为 Markdown / Word / PD
   --md-only           只导出 Markdown 与图片，不生成 Word/PDF
   --keep-html         保留中间 HTML
   -t, --token <值>    私有文档所需的语雀 cookie（_yuque_session）
+                      也可用环境变量 YUQUE_COOKIE，避免留在 shell 历史里
   --book              导出整本知识库（默认关闭）
-  --limit <n>         配合 --book，最多导出前 n 篇
+  --limit <n>         配合 --book，最多导出前 n 篇（正整数）
   -h, --help          显示帮助
   -v, --version       显示版本号
 
@@ -84,25 +87,40 @@ function log(step, msg) {
   console.log(`[${step}] ${msg}`);
 }
 
-/** 依赖自举：从 zip 安装时没有 node_modules，首次运行自动补齐 */
-function ensureDeps() {
-  const root = path.resolve(__dirname, '..');
-  const missing = ['marked', 'html-to-docx'].filter(
-    (m) => !fs.existsSync(path.join(root, 'node_modules', m))
-  );
-  if (!missing.length) return;
-  log('0/3', `首次运行，安装依赖（${missing.join(', ')}）...`);
-  const r = require('child_process').spawnSync('npm', ['install', '--no-audit', '--no-fund'], {
-    cwd: root, shell: true, stdio: 'inherit',
+/**
+ * 依赖检查：从源码目录 / Agent 技能目录直接运行时可能没装依赖。
+ * 这里只给出可操作的提示，不代替用户执行安装（避免污染全局安装目录）。
+ */
+function checkDeps() {
+  const missing = ['marked', 'html-to-docx'].filter((m) => {
+    try {
+      require.resolve(m);
+      return false;
+    } catch {
+      return true;
+    }
   });
-  if (r.status !== 0) {
-    throw new Error(`依赖安装失败，请手动执行：cd "${root}" && npm install`);
+  if (!missing.length) return;
+  const root = path.resolve(__dirname, '..');
+  throw new Error(
+    `缺少依赖：${missing.join(', ')}\n` +
+    `请先安装：cd "${root}" && npm install\n` +
+    '（通过 npm install -g / npx 安装时不会出现这个问题）'
+  );
+}
+
+/** 校验 --limit：必须为正整数，拒绝 -1 / abc / 0 */
+function readLimit(opts) {
+  if (opts.limitRaw === null) return 0;
+  const n = Number(opts.limitRaw);
+  if (!Number.isInteger(n) || n <= 0) {
+    throw new Error(`--limit 需要正整数，收到 "${opts.limitRaw}"`);
   }
+  return n;
 }
 
 /** 导出单篇：下载正文+图片，写 md，转 docx/pdf */
-async function exportDoc(ctx, docSlug, docTitle, outDir, opts, stepLabel) {
-  const referer = `https://www.yuque.com/${ctx.bookSlug}/${docSlug}`;
+async function exportDoc({ ctx, docSlug, docTitle, outDir, opts, referer, stepLabel }) {
   const body = await fetchDocBody(
     { bookId: ctx.bookId, docSlug, docTitle }, opts.token, referer
   );
@@ -114,14 +132,18 @@ async function exportDoc(ctx, docSlug, docTitle, outDir, opts, stepLabel) {
   fs.writeFileSync(mdPath, imgs.markdown, 'utf8');
   log(stepLabel, `md   : ${path.basename(mdPath)}`);
 
-  if (imgs.count) log(stepLabel, `图片 : ${imgs.count} 张已下载` + (imgs.failed.length ? `，${imgs.failed.length} 张失败` : ''));
-  imgs.failed.slice(0, 3).forEach((f) => console.warn('        ! ' + f));
+  if (imgs.count) log(stepLabel, `图片 : ${imgs.count} 张已下载`);
+  if (imgs.failed.length) {
+    console.warn(`         ! ${imgs.failed.length} 张图片下载失败，已保留原始链接：`);
+    imgs.failed.slice(0, 3).forEach((f) => console.warn('           ' + f));
+  }
 
   if (opts.mdOnly) return mdPath;
 
   const base = mdPath.replace(/\.md$/, '');
-  const { html, inlined } = markdownToHtml(imgs.markdown, outDir);
+  const { html, inlined, skipped } = markdownToHtml(imgs.markdown, outDir);
   if (opts.keepHtml) fs.writeFileSync(base + '.html', html, 'utf8');
+  if (skipped) console.warn(`         ! ${skipped} 张图片路径越界，已跳过（不读取输出目录外的文件）`);
 
   const docxPath = base + '.docx';
   const size = await htmlToDocx(html, path.basename(base), docxPath);
@@ -142,10 +164,12 @@ async function main() {
   if (opts.help) { help(); process.exit(0); }
   if (!opts.url) { help(); process.exit(1); }
 
+  const limit = readLimit(opts);
   const parts = parseUrl(opts.url);
+  checkDeps();
+
   const outDir = path.resolve(opts.out);
   await ensureDir(outDir);
-  ensureDeps();
 
   if (!opts.book) {
     if (!parts.docSlug) {
@@ -156,7 +180,9 @@ async function main() {
     if (!ctx.docSlug) throw new Error('页面中未找到文档信息，可能是知识库首页；单篇导出请使用具体文档链接。');
     ctx.docId = ctx.docId || ctx.docSlug;
     log('2/2', `生成文件到 ${outDir}`);
-    await exportDoc(ctx, ctx.docSlug, ctx.docTitle, outDir, opts, '  →');
+    // Referer 用 login/book/doc 完整拼装，而不是在入口 URL 后追加
+    const referer = docUrl(parts.login, parts.bookSlug, ctx.docSlug);
+    await exportDoc({ ctx, docSlug: ctx.docSlug, docTitle: ctx.docTitle, outDir, opts, referer, stepLabel: '  →' });
     console.log('\n完成。');
     return;
   }
@@ -175,11 +201,11 @@ async function main() {
   if (!ctx.toc.length) throw new Error('未读取到目录。该知识库可能不公开，请用 -t 传入 cookie。');
 
   const docs = ctx.toc.filter((t) => t.type === 'DOC' && t.visible !== false && t.url);
-  const list = opts.limit > 0 ? docs.slice(0, opts.limit) : docs;
+  const list = limit > 0 ? docs.slice(0, limit) : docs;
   const bookDir = path.join(outDir, safeName(ctx.bookName || parts.bookSlug));
   await ensureDir(bookDir);
 
-  log('2/3', `目录 ${docs.length} 篇` + (opts.limit ? `，本次处理前 ${list.length} 篇` : ''));
+  log('2/3', `目录 ${docs.length} 篇` + (limit ? `，本次处理前 ${list.length} 篇` : ''));
 
   const index = [];
   let ok = 0;
@@ -187,9 +213,11 @@ async function main() {
     const item = list[i];
     const label = `  (${i + 1}/${list.length})`;
     try {
-      const body = await fetchDocBody({ bookId: ctx.bookId, docSlug: item.url, docTitle: item.title }, opts.token, `${parts.canonical}/${item.url}`);
+      // 每篇的 Referer 都要按 login/book/doc 重新拼，避免叠成 …/doc1/doc2
+      const referer = docUrl(parts.login, parts.bookSlug, item.url);
+      const body = await fetchDocBody({ bookId: ctx.bookId, docSlug: item.url, docTitle: item.title }, opts.token, referer);
       const md = cleanLakeSource(body.markdown);
-      const imgs = await downloadImages(md, item.uuid || item.url, `${parts.canonical}/${item.url}`, opts.token, path.join(bookDir, 'img'));
+      const imgs = await downloadImages(md, item.uuid || item.url, referer, opts.token, path.join(bookDir, 'img'));
       const mdPath = uniquePath(bookDir, safeName(body.title || item.title) + '.md');
       fs.writeFileSync(mdPath, imgs.markdown, 'utf8');
       log('   ', `${label} ${path.basename(mdPath)}`);
@@ -197,6 +225,7 @@ async function main() {
       if (!opts.mdOnly) {
         const base = mdPath.replace(/\.md$/, '');
         const { html } = markdownToHtml(imgs.markdown, bookDir);
+        if (opts.keepHtml) fs.writeFileSync(base + '.html', html, 'utf8');
         await htmlToDocx(html, path.basename(base), base + '.docx');
         if (opts.pdf) htmlToPdf(html, base + '.pdf', bookDir);
       }

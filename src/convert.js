@@ -3,6 +3,8 @@
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { pathToFileURL } = require('url');
+const { isInside } = require('./fsutil');
 
 const CSS = `
 body{font-family:"Microsoft YaHei","PingFang SC","Hiragino Sans GB","Noto Sans CJK SC",sans-serif;font-size:12pt;line-height:1.75;color:#1f2328}
@@ -47,33 +49,60 @@ function browserPath() {
   return cands.find((p) => fs.existsSync(p)) || null;
 }
 
-/** 把 HTML 中的本地相对图片转 base64，确保 docx 单文件内嵌 */
+/**
+ * 过滤 Markdown 中的原始 HTML：语雀正文可能夹带 <script> / <iframe> /
+ * on* 事件属性，生成 HTML 后会交给浏览器打印，必须在之前清掉。
+ */
+function sanitizeHtml(html) {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<(iframe|object|embed|link|base)[\s\S]*?>/gi, '')
+    .replace(/\son[a-z]+\s*=\s*"[^"]*"/gi, '')
+    .replace(/\son[a-z]+\s*=\s*'[^']*'/gi, '')
+    .replace(/(href|src)\s*=\s*"\s*javascript:[^"]*"/gi, '$1=""');
+}
+
+/**
+ * 把 HTML 中的本地相对图片转 base64，确保 docx 单文件内嵌。
+ * 只允许读取输出目录内的文件，避免 `../../` 引用把本机其他文件塞进文档。
+ */
 function inlineImages(html, baseDir) {
   const MIME = {
     '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
     '.webp': 'image/webp', '.bmp': 'image/bmp', '.svg': 'image/svg+xml',
   };
   let count = 0;
+  let skipped = 0;
   const out = html.replace(/<img([^>]*?)src="([^"]+)"([^>]*?)>/gi, (m, pre, src, post) => {
     if (/^(https?:|data:)/i.test(src)) return m;
-    const rel = decodeURIComponent(src.replace(/^\.\//, '').split('#')[0].split('?')[0]);
+    let rel;
+    try {
+      rel = decodeURIComponent(src.replace(/^\.\//, '').split('#')[0].split('?')[0]);
+    } catch {
+      return m;
+    }
     const abs = path.resolve(baseDir, rel);
-    if (!fs.existsSync(abs)) return m;
+    if (!isInside(baseDir, abs)) {
+      skipped++;
+      return m;
+    }
+    if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) return m;
     const mime = MIME[path.extname(abs).toLowerCase()] || 'image/png';
     count++;
     return `<img${pre}src="data:${mime};base64,${fs.readFileSync(abs).toString('base64')}"${post}>`;
   });
-  return { html: out, count };
+  return { html: out, count, skipped };
 }
 
-/** @returns {{html: string, inlined: number}} */
+/** @returns {{html: string, inlined: number, skipped: number}} */
 function markdownToHtml(markdown, baseDir) {
   const { marked } = require('marked');
-  const body = marked.parse(markdown, { gfm: true });
-  const { html, count } = inlineImages(body, baseDir);
+  const body = sanitizeHtml(marked.parse(markdown, { gfm: true }));
+  const { html, count, skipped } = inlineImages(body, baseDir);
   return {
     html: `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><style>${CSS}</style></head><body>${html}</body></html>`,
     inlined: count,
+    skipped,
   };
 }
 
@@ -90,15 +119,35 @@ async function htmlToDocx(html, title, outPath) {
   return buf.length;
 }
 
+/**
+ * 用本机 Chromium 系浏览器无头打印 PDF。
+ * 注意：先删掉同名旧文件，避免上一次的产物让本次失败被误判为成功。
+ */
 function htmlToPdf(html, outPath, baseDir) {
   const exe = browserPath();
   if (!exe) return { ok: false, reason: '未找到 Chrome/Edge/Chromium' };
+
   const tmp = path.join(baseDir, '.yuque-export-print.html');
-  fs.writeFileSync(tmp, html, 'utf8');
-  const url = 'file:///' + tmp.replace(/\\/g, '/');
-  spawnSync(exe, ['--headless', '--disable-gpu', '--no-pdf-header-footer', `--print-to-pdf=${outPath}`, url], { stdio: 'ignore' });
-  try { fs.unlinkSync(tmp); } catch {}
-  return fs.existsSync(outPath) ? { ok: true } : { ok: false, reason: 'PDF 生成失败' };
+  try {
+    fs.writeFileSync(tmp, html, 'utf8');
+    if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
+
+    const r = spawnSync(
+      exe,
+      [
+        '--headless', '--disable-gpu', '--disable-javascript',
+        '--no-pdf-header-footer', `--print-to-pdf=${outPath}`,
+        pathToFileURL(tmp).href,
+      ],
+      { stdio: 'ignore', timeout: 120000 }
+    );
+    if (r.error) return { ok: false, reason: r.error.message };
+    if (r.status !== 0) return { ok: false, reason: `浏览器退出码 ${r.status}` };
+    if (!fs.existsSync(outPath)) return { ok: false, reason: 'PDF 未生成' };
+    return { ok: true };
+  } finally {
+    try { fs.unlinkSync(tmp); } catch { /* 清理失败不影响结果 */ }
+  }
 }
 
-module.exports = { markdownToHtml, htmlToDocx, htmlToPdf, browserPath, CSS };
+module.exports = { markdownToHtml, htmlToDocx, htmlToPdf, sanitizeHtml, browserPath, CSS };

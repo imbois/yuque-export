@@ -10,16 +10,23 @@ async function writeFile(file, data) {
   await fs.promises.writeFile(file, data);
 }
 
-/** 文件名安全化：去掉非法字符、压缩空白、限长 */
+const WIN_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.[^.]*)?$/i;
+
+/** 文件名安全化：去掉非法字符、压缩空白、限长、避开 Windows 保留名 */
 function safeName(name, fallback = 'untitled') {
   let s = String(name || '')
     .replace(/[\\/:*?"<>|\r\n\t]/g, '_')
     .replace(/\s+/g, ' ')
     .replace(/^\.+/, '')
-    .trim();
+    .trim()
+    // Windows 不接受结尾的空格与点
+    .replace(/[. ]+$/, '');
   if (!s) s = fallback;
   const ext = path.extname(s);
-  const base = s.slice(0, s.length - ext.length).slice(0, 80);
+  let base = s.slice(0, s.length - ext.length).slice(0, 80).replace(/[. ]+$/, '');
+  if (!base) base = fallback;
+  // CON / NUL / COM1 这类保留设备名在 Windows 上无法创建
+  if (WIN_RESERVED.test(base + ext) || WIN_RESERVED.test(base)) base = '_' + base;
   return base + ext;
 }
 
@@ -36,4 +43,15 @@ function uniquePath(dir, fileName) {
   return p;
 }
 
-module.exports = { ensureDir, writeFile, safeName, uniquePath };
+/**
+ * 目标路径是否仍在基准目录内。
+ * 用于阻止 Markdown 里的 `../../` 之类引用读到输出目录之外的文件。
+ */
+function isInside(baseDir, target) {
+  const base = path.resolve(baseDir);
+  const abs = path.resolve(target);
+  const rel = path.relative(base, abs);
+  return !!rel && !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
+module.exports = { ensureDir, writeFile, safeName, uniquePath, isInside };

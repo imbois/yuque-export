@@ -32,7 +32,11 @@ npx yuque-export "https://www.yuque.com/user/book/doc"
 
 ```bash
 git clone https://github.com/imbois/yuque-export.git ~/.workbuddy/skills/yuque-export
+cd ~/.workbuddy/skills/yuque-export && npm install
 ```
+
+> 从源码/技能目录运行时**需要先 `npm install`**（`npm i -g` 和 `npx` 会自动装好依赖）。
+> CLI 检测到缺依赖时会提示这一句，但不会替你执行安装。
 
 ## 用法
 
@@ -45,6 +49,8 @@ yuque-export "https://www.yuque.com/user/book/doc" --md-only -o ./notes
 
 # 私有文档（浏览器 cookie 里的 _yuque_session）
 yuque-export "https://www.yuque.com/user/book/doc" -t "<cookie值>"
+# 更推荐：用环境变量，避免 cookie 留在 shell 历史里
+YUQUE_COOKIE="<cookie值>" yuque-export "https://www.yuque.com/user/book/doc"
 
 # 整本知识库（默认不会遍历，必须显式 --book）
 yuque-export "https://www.yuque.com/user/book/任一公开文档" --book --limit 10
@@ -56,9 +62,9 @@ yuque-export "https://www.yuque.com/user/book/任一公开文档" --book --limit
 | `--pdf` | 同时生成 PDF（用本机 Chrome/Edge/Chromium 无头打印） |
 | `--md-only` | 只导出 Markdown + 图片 |
 | `--keep-html` | 保留中间 HTML |
-| `-t, --token <值>` | 私有文档需要的语雀 cookie |
+| `-t, --token <值>` | 私有文档需要的语雀 cookie；也可用环境变量 `YUQUE_COOKIE` |
 | `--book` | 整本导出（默认关闭） |
-| `--limit <n>` | 配合 `--book`，只导出前 n 篇 |
+| `--limit <n>` | 配合 `--book`，只导出前 n 篇（正整数） |
 | `-h, --help` | 帮助 |
 
 ## 输出结构
@@ -68,8 +74,11 @@ output/
 ├── 文档标题.md      Markdown（图片为相对路径）
 ├── 文档标题.docx    Word（图片已内嵌）
 ├── 文档标题.pdf     加了 --pdf 才有
-└── img/<docId>/     下载到的原始图片
+└── img/<docId>/     下载到的图片，文件名形如 logo-3f2a9c1d.png
 ```
+
+图片名带 URL 短哈希，不同 CDN 上同名的图片不会互相覆盖；下载失败的图片**不会被改写**，
+Markdown 里保留原始链接并在终端给出警告——宁可链接是远程的，也不给你一个死链。
 
 ## 工作原理
 
@@ -100,6 +109,21 @@ output/
 若要兼容 16，需要额外引入 fetch polyfill 并把 `marked` 降到 v9，对输出的表格/代码块质量是净损失，
 因此选择"明确拒绝"而不是"假装支持"。CI 在 18 / 20 / 22 / 24 四个大版本上验证。
 
+## 安全性
+
+文档内容属于外部输入，因此做了这些边界限制：
+
+| 风险 | 处理方式 |
+|---|---|
+| 登录态泄露 | cookie / Referer **只发给 `*.yuque.com`**，第三方图片域名只带通用 UA |
+| 读取本机其他文件 | 内嵌图片路径必须落在输出目录内，`../` 越界引用一律跳过 |
+| 借文档探测内网 | 拒绝下载 `localhost` / `10.x` / `172.16-31.x` / `192.168.x` / 链路本地地址 |
+| 资源耗尽 | 单张图片 20MB 上限，30 秒超时 |
+| 打印时执行脚本 | 生成 HTML 前清除 `<script>` / `<iframe>` / `on*` 事件属性，PDF 以 `--disable-javascript` 打印 |
+| 文件名异常 | 过滤非法字符、避开 Windows 保留设备名（CON/NUL/COM1） |
+
+范围内说明：本工具为**本地命令行程序**，不做服务端部署，因此不涉及 CSRF、鉴权绕过等 Web 攻击面。
+
 ## 已知限制
 
 - 语雀的**画板 / 思维导图 / 数据表**是挂件，导出后会变成链接或空白；
@@ -113,7 +137,8 @@ output/
 该文档不是公开的。用 `-t` 传 cookie，或找作者要权限。
 
 **Q：图片在 Word 里没显示？**
-看 `img/<docId>/` 是否有对应文件。失败的多为需要鉴权的 CDN 图片，md 里会保留原始链接。
+看 `img/<docId>/` 是否有对应文件。需要鉴权的 CDN 图片会下载失败，此时 Markdown 与 Word 里
+**都保留原始链接**（终端会打印哪几张失败），联网环境下仍能看到图片。
 
 **Q：为什么不直接用 pandoc？**
 可以，但 pandoc 出 PDF 要装 LaTeX 并配中文字体。本方案零额外系统依赖。
@@ -127,7 +152,10 @@ yuque-export/
 │   ├── cli.js        命令行入口
 │   ├── client.js     语雀接口客户端（无第三方 SDK）
 │   ├── convert.js    md → html → docx/pdf
-│   └── fsutil.js     文件工具
+│   └── fsutil.js     文件工具（命名安全化、路径边界）
+├── test/
+│   └── smoke.js      20 项离线测试（含本地 Mock HTTP 下载链路）
+├── .github/workflows/ci.yml
 ├── package.json
 ├── README.md
 └── LICENSE

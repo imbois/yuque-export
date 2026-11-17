@@ -31,12 +31,16 @@ only when the user explicitly asks for it and `--book` is passed.
 ## Usage
 
 Requires Node.js 18.4+ (`engines` enforces a readable error below that; 20/22/24 recommended).
-Dependencies install on first run. If `node -v` reports < 18, ask the user to upgrade via nvm
-or install the LTS from nodejs.org — do not attempt to polyfill `fetch`.
+If `node -v` reports < 18, ask the user to upgrade via nvm or install the LTS from nodejs.org —
+do not attempt to polyfill `fetch`.
+
+**Dependencies:** when the skill was installed by copying/cloning the repo, run `npm install`
+in the skill directory first (once). The CLI deliberately does not auto-install packages; if
+dependencies are missing it exits with the exact command to run. `npx yuque-export` needs no setup.
 
 ```bash
 npx yuque-export "<yuque-url>" [options]
-# or, when running from a checkout
+# or, when running from a checkout (run `npm install` once beforehand)
 node src/cli.js "<yuque-url>" [options]
 ```
 
@@ -46,7 +50,7 @@ node src/cli.js "<yuque-url>" [options]
 | `--pdf` | Also render PDF via local Chrome/Edge/Chromium |
 | `--md-only` | Export Markdown and images only |
 | `--keep-html` | Keep the intermediate styled HTML |
-| `-t, --token <val>` | Yuque cookie value (`_yuque_session`) for private documents |
+| `-t, --token <val>` | Yuque cookie value (`_yuque_session`) for private documents; `YUQUE_COOKIE` env var also works and avoids leaving it in shell history |
 | `--book` | Export the whole knowledge base (explicit opt-in) |
 | `--limit <n>` | With `--book`, stop after the first n documents |
 | `-h, --help` | Show help |
