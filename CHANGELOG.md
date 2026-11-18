@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.0.2 — 2026-11-18
+
+无 CLI 行为变更，本版本是发布基础设施版本：
+
+- **自动化发布**：新增 `.github/workflows/publish.yml`，推送 `v*` 标签时经 npm Trusted Publishing（OIDC）自动发布；普通 push main 只跑测试，不触发发布。发布前校验：标签版本与 `package.json` 一致、标签提交在 main 上、`repository.url` 与仓库一致、版本未存在于 npm
+- 仓库内**零密钥**：不使用任何长期 npm Token，OIDC 换取短时凭证，发布自动附带 provenance
+- 新增 `RELEASING.md`（发布流程、失败排查、Trusted Publisher 恢复）
+- README：修正「图片在 Word 里没显示」的说明，与实际行为一致（下载失败的远程图不再进入 Word/PDF）
+
 ## 2.0.1 — 2026-11-17
 
 发布前代码审查（code review）整改版本。**无 API 变更**，全部为行为修正与加固。
