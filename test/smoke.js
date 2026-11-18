@@ -14,7 +14,7 @@ process.env.YUQUE_EXPORT_ALLOW_PRIVATE = '1';
 
 const {
   parseUrl, docUrl, isPrivateHost, isPrivateIp, assertPublicTarget, collectImageUrls,
-  cleanLakeSource, downloadImages, urls2name,
+  cleanLakeSource, downloadImages, urls2name, looksLikeImage,
 } = require('../src/client');
 const { markdownToHtml, htmlToDocx } = require('../src/convert');
 const { safeName, isInside } = require('../src/fsutil');
@@ -74,6 +74,11 @@ function startServer() {
       res.writeHead(302, { location: '/loop' });
       return res.end();
     }
+    if (req.url === '/evil-icns.png') {
+      // ICNS 魔数 + image/* content-type：伪装成图片的恶意格式
+      res.writeHead(200, { 'content-type': 'image/x-icns', 'content-length': PNG.length });
+      return res.end(Buffer.concat([Buffer.from('icns\x00\x00\x00\x10'), PNG]));
+    }
     if (req.url.startsWith('/ok')) {
       res.writeHead(200, { 'content-type': 'image/png', 'content-length': PNG.length });
       return res.end(PNG);
@@ -125,6 +130,22 @@ function startServer() {
     assert.ok(isPrivateHost('10.0.0.5'));
     assert.ok(isPrivateHost('localhost'));
     assert.ok(!isPrivateHost('cdn.nlark.com'));
+  });
+
+  await t('图片魔数白名单（防下游解析器死循环）', () => {
+    const png = Buffer.from('89504e470d0a1a0a00000000', 'hex');
+    assert.ok(looksLikeImage(png), 'PNG 应通过');
+    assert.ok(looksLikeImage(Buffer.from('BM\x46\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')), 'BMP 应通过');
+    assert.ok(looksLikeImage(Buffer.from('\xff\xd8\xff\xe0' + '0'.repeat(9), 'latin1')), 'JPEG 应通过');
+    assert.ok(looksLikeImage(Buffer.from('GIF89a' + '0'.repeat(7))), 'GIF 应通过');
+    assert.ok(looksLikeImage(Buffer.from('RIFF0000WEBP' + '0'.repeat(4))), 'WebP 应通过');
+    assert.ok(looksLikeImage(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg">...</svg>')), 'SVG 应通过');
+    const icns = Buffer.concat([Buffer.from('icns\x00\x00\x00\x10'), png]);
+    assert.ok(!looksLikeImage(icns), 'ICNS 应被拒绝');
+    const heif = Buffer.concat([Buffer.alloc(4), Buffer.from('ftypheic'), Buffer.alloc(8)]);
+    assert.ok(!looksLikeImage(heif), 'HEIF 应被拒绝');
+    assert.ok(!looksLikeImage(Buffer.from('<script>alert(1)</script>')), '非图片 HTML 应被拒绝');
+    assert.ok(!looksLikeImage(Buffer.alloc(8)), '过短数据应被拒绝');
   });
 
   await t('内网 IP 网段识别（含 IPv6 与 CGNAT）', () => {
@@ -273,6 +294,14 @@ function startServer() {
       const r = await downloadImages(`![x](${base}/loop)`, 'd', '', null, dir);
       assert.strictEqual(r.count, 0);
       assert.ok(/重定向超过/.test(r.failed[0] || ''), '应中止重定向循环：' + r.failed[0]);
+    });
+
+    await t('伪装成图片的恶意格式（ICNS）被魔数校验拒绝', async () => {
+      const dir = tmpDir('icns');
+      const r = await downloadImages(`![x](${base}/evil-icns.png)`, 'd', '', null, dir);
+      assert.strictEqual(r.count, 0, '不应下载成功');
+      assert.ok(/魔数校验失败/.test(r.failed[0] || ''), '应因魔数白名单失败：' + r.failed[0]);
+      assert.ok(r.markdown.includes(`${base}/evil-icns.png`), '失败后保留原始 URL');
     });
   } finally {
     server.close();

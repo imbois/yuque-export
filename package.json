@@ -46,5 +46,8 @@
   },
   "bugs": {
     "url": "https://github.com/imbois/yuque-export/issues"
+  },
+  "overrides": {
+    "image-size": "^2.0.3"
   }
 }

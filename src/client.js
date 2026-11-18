@@ -273,6 +273,27 @@ async function readLimited(res) {
   return Buffer.concat(chunks);
 }
 
+/**
+ * 图片魔数白名单：只放行 PNG/JPEG/GIF/WebP/BMP/SVG。
+ *
+ * 背景：下游 html-to-docx 内嵌的 image-size 解析器在 JXL/HEIF/ICNS 格式上存在
+ * 无限循环 DoS 漏洞（GHSA-5p2g-fcmc-qvqq / GHSA-w3rx-r6r6-pgpr），且该解析器
+ * 按魔数嗅探、不看扩展名。文档内容不可信，攻击者可用假扩展名的恶意格式图片
+ * 打挂导出进程，故在下载侧直接拒绝白名单以外的所有格式。
+ */
+function looksLikeImage(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 12) return false;
+  const ascii = (s, off = 0) => buf.slice(off, off + s.length).toString('latin1') === s;
+  if (ascii('\x89PNG\r\n\x1a\n')) return true; // PNG
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return true; // JPEG
+  if (ascii('GIF87a') || ascii('GIF89a')) return true; // GIF
+  if (ascii('RIFF') && ascii('WEBP', 8)) return true; // WebP
+  if (ascii('BM') && buf[2] !== 0) return true; // BMP
+  const head = buf.slice(0, 256).toString('utf8').trimStart().toLowerCase();
+  if (head.startsWith('<?xml') || head.startsWith('<svg')) return true; // SVG
+  return false;
+}
+
 /** 下载单张图片，返回 buffer；失败抛错 */
 async function fetchImage(url, cookie, referer) {
   // safeFetch 已做逐跳内网/DNS 校验，且 cookie/referer 只发给 yuque.com 系域名
@@ -290,6 +311,7 @@ async function fetchImage(url, cookie, referer) {
   }
   const buf = await readLimited(res);
   if (!buf.length) throw new Error('空响应');
+  if (!looksLikeImage(buf)) throw new Error('非支持的图片格式（魔数校验失败）');
   return buf;
 }
 
@@ -383,6 +405,7 @@ module.exports = {
   isPrivateIp,
   assertPublicTarget,
   safeFetch,
+  looksLikeImage,
   collectImageUrls,
   fetchContext,
   fetchDocBody,

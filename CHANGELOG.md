@@ -37,6 +37,14 @@
 - **同步 package-lock.json**：lock 顶层版本号已与 package.json 一致（2.0.1）
 - 测试扩到 25 项（新增内网 IP 网段/IPv6、重定向循环、流式超限、无引号属性过滤等）
 
+### 发布前依赖安全评估（2026-11-18）
+
+针对 `npm audit --omit=dev` 的两个告警：
+
+- **image-size（High，经 html-to-docx 传递）→ 已实质封堵**：html-to-docx 的 dist **内嵌**了 image-size v1 的解析器，仅 `overrides` 升级外部依赖只能清告警、修不了真实路径。因此在下载侧新增**图片魔数白名单**（仅 PNG/JPEG/GIF/WebP/BMP/SVG），ICNS/HEIF/JXL 一律拒绝；源 Markdown 自带的 `data:` 图片同样校验。另加 `overrides: image-size@^2.0.3` 清掉独立依赖告警
+- **sanitize-html（Moderate）→ 保留 2.17.1 的兼容性妥协**：公告向量（`action`/`formaction`/`poster`/`background`/`meta`/`svg`/`textarea`）不在本项目白名单内，不可达；输出汇点（docx 解析、`--disable-javascript` 打印）不执行脚本。README 增补“依赖安全说明”记录取舍
+- 测试扩到 **27 项**（新增魔数白名单单测与 ICNS 伪装下载拦截）
+
 ## 2.0.0 — 2026-11-17
 
 首个公开版本。完全自研的语雀公开内容客户端（不依赖第三方语雀 SDK）：

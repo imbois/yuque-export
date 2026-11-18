@@ -117,12 +117,23 @@ Markdown 里保留原始链接并在终端给出警告——宁可链接是远�
 |---|---|
 | 登录态泄露 | cookie / Referer **只发给 `*.yuque.com`**，第三方图片域名只带通用 UA |
 | 读取本机其他文件 | 内嵌图片路径必须落在输出目录内，`../` 越界引用一律跳过 |
-| 借文档探测内网 | 拒绝下载 `localhost` / `10.x` / `172.16-31.x` / `192.168.x` / 链路本地地址 |
-| 资源耗尽 | 单张图片 20MB 上限，30 秒超时 |
-| 打印时执行脚本 | 生成 HTML 前清除 `<script>` / `<iframe>` / `on*` 事件属性，PDF 以 `--disable-javascript` 打印 |
+| 借文档探测内网 | 拒绝下载 `localhost` / `10.x` / `172.16-31.x` / `192.168.x` / 链路本地地址；**重定向逐跳复检**，并校验 DNS 解析后的 IP |
+| 资源耗尽 | 单张图片 20MB 上限（流式中断），30 秒超时 |
+| 恶意格式图片 | 只接受 PNG / JPEG / GIF / WebP / BMP / SVG 的**魔数**，拒绝 ICNS、HEIF、JXL 等（防止下游解析器死循环） |
+| 打印时执行脚本 | 用 `sanitize-html` 白名单过滤原始 HTML（`<script>` / `<iframe>` / `on*` / `javascript:` 均被清除），PDF 以 `--disable-javascript` 打印 |
 | 文件名异常 | 过滤非法字符、避开 Windows 保留设备名（CON/NUL/COM1） |
 
 范围内说明：本工具为**本地命令行程序**，不做服务端部署，因此不涉及 CSRF、鉴权绕过等 Web 攻击面。
+
+### 依赖安全说明（npm audit）
+
+`npm audit --omit=dev` 可能报告 1 个 moderate（`sanitize-html` 相关公告）。这是**为兼容 Node 18 的已知妥协**，说明如下：
+
+- `sanitize-html` 2.17.2 起依赖 ESM-only 的 `htmlparser2@10+`，2.17.6 起更要求 Node ≥ 22.12；本项目锁定 **2.17.1**（最后一个 CJS 版本）以维持 `engines: >=18.4`
+- 公告涉及的攻击向量在本项目的配置下**不可达**：`action` / `formaction` / `poster` / `background` / `meta` / `svg` / `textarea` 均不在允许标签与属性白名单内，会被直接剥离
+- 输出汇点不执行脚本：docx 由 `html-to-docx` 解析为 OOXML，PDF 打印时 `--disable-javascript`
+- 若你的环境只使用 Node ≥ 22.12，可自行升级 `sanitize-html@2.18+` 消除该告警，功能不受影响
+
 
 ## 已知限制
 

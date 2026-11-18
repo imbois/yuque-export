@@ -5,6 +5,7 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 const { pathToFileURL } = require('url');
 const { isInside } = require('./fsutil');
+const { looksLikeImage } = require('./client');
 
 const CSS = `
 body{font-family:"Microsoft YaHei","PingFang SC","Hiragino Sans GB","Noto Sans CJK SC",sans-serif;font-size:12pt;line-height:1.75;color:#1f2328}
@@ -94,7 +95,17 @@ function inlineImages(html, baseDir) {
   let count = 0;
   let skipped = 0;
   const out = html.replace(/<img([^>]*?)src="([^"]+)"([^>]*?)>/gi, (m, pre, src, post) => {
-    if (/^(https?:|data:)/i.test(src)) return m;
+    if (/^(https?:)/i.test(src)) return m;
+    // 源文档自带的 data: 图片同样不可信：魔数不在白名单（如 ICNS/HEIF/JXL）
+    // 会触发下游解析器死循环，直接移除该 <img>
+    if (/^data:/i.test(src)) {
+      const m64 = /^data:image\/[a-z0-9.+-]+;base64,([\s\S]+)$/i.exec(src);
+      if (!m64) { skipped++; return ''; }
+      let head;
+      try { head = Buffer.from(m64[1].slice(0, 512), 'base64'); } catch { skipped++; return ''; }
+      if (!looksLikeImage(head)) { skipped++; return ''; }
+      return m;
+    }
     let rel;
     try {
       rel = decodeURIComponent(src.replace(/^\.\//, '').split('#')[0].split('?')[0]);
