@@ -5,7 +5,7 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 const { pathToFileURL } = require('url');
 const { isInside } = require('./fsutil');
-const { looksLikeImage } = require('./client');
+const { detectImageType, IMAGE_MIME, MAX_IMAGE_BYTES } = require('./client');
 
 const CSS = `
 body{font-family:"Microsoft YaHei","PingFang SC","Hiragino Sans GB","Noto Sans CJK SC",sans-serif;font-size:12pt;line-height:1.75;color:#1f2328}
@@ -84,28 +84,55 @@ function sanitizeHtml(html) {
 }
 
 /**
+ * 内嵌图片统一校验：体积上限 + 魔数白名单。
+ *
+ * 网络下载、本地相对路径、文档自带的 data: 三条输入路径都必须过这里 ——
+ * 只要有一条漏检，畸形字节就会进到下游 html-to-docx 内嵌的 image-size
+ * 解析器（JXL/HEIF/ICNS 可致无限循环），前面下载侧的防护就白做了。
+ */
+function inspectImage(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length === 0) return { ok: false, reason: '空数据' };
+  if (buf.length > MAX_IMAGE_BYTES) {
+    return { ok: false, reason: `体积超限 ${(buf.length / 1048576).toFixed(1)}MB` };
+  }
+  const type = detectImageType(buf);
+  if (!type) return { ok: false, reason: '魔数不在白名单' };
+  return { ok: true, type, mime: IMAGE_MIME[type] };
+}
+
+/**
  * 把 HTML 中的本地相对图片转 base64，确保 docx 单文件内嵌。
  * 只允许读取输出目录内的文件，避免 `../../` 引用把本机其他文件塞进文档。
  */
 function inlineImages(html, baseDir) {
-  const MIME = {
-    '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
-    '.webp': 'image/webp', '.bmp': 'image/bmp', '.svg': 'image/svg+xml',
-  };
   let count = 0;
   let skipped = 0;
+
+  // 基准目录自身可能是符号链接（macOS 的 /var → /private/var 就是），
+  // 拿真实路径比对，否则合法文件会被误判成越界
+  let realBase = path.resolve(baseDir);
+  try { realBase = fs.realpathSync(realBase); } catch { /* 目录不存在时退回原路径 */ }
+
   const out = html.replace(/<img([^>]*?)src="([^"]+)"([^>]*?)>/gi, (m, pre, src, post) => {
-    if (/^(https?:)/i.test(src)) return m;
-    // 源文档自带的 data: 图片同样不可信：魔数不在白名单（如 ICNS/HEIF/JXL）
-    // 会触发下游解析器死循环，直接移除该 <img>
+    // 远程图片在下载阶段就做完了 SSRF / 体积 / 魔数校验，留到这里的都是下载失败的。
+    // 若原样交给下游，html-to-docx 会自己再发一次请求（实测确实会分别请求 http/https），
+    // PDF 的浏览器同样会去加载 —— 等于绕开上面所有校验，因此这里直接移除；
+    // 原始链接仍保留在 .md 文件里，需要时可手动补回。
+    if (/^(https?:)/i.test(src)) { skipped++; return ''; }
+
+    // 源文档自带的 data: 图片同样不可信：体积与魔数都要卡
     if (/^data:/i.test(src)) {
       const m64 = /^data:image\/[a-z0-9.+-]+;base64,([\s\S]+)$/i.exec(src);
       if (!m64) { skipped++; return ''; }
+      const payload = m64[1];
+      // 先按 base64 字符数折算解码后体积，不为超大字符串分配 buffer
+      if (Math.floor((payload.length * 3) / 4) > MAX_IMAGE_BYTES) { skipped++; return ''; }
       let head;
-      try { head = Buffer.from(m64[1].slice(0, 512), 'base64'); } catch { skipped++; return ''; }
-      if (!looksLikeImage(head)) { skipped++; return ''; }
+      try { head = Buffer.from(payload.slice(0, 512), 'base64'); } catch { skipped++; return ''; }
+      if (!detectImageType(head)) { skipped++; return ''; }
       return m;
     }
+
     let rel;
     try {
       rel = decodeURIComponent(src.replace(/^\.\//, '').split('#')[0].split('?')[0]);
@@ -113,14 +140,26 @@ function inlineImages(html, baseDir) {
       return m;
     }
     const abs = path.resolve(baseDir, rel);
-    if (!isInside(baseDir, abs)) {
-      skipped++;
-      return m;
-    }
-    if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) return m;
-    const mime = MIME[path.extname(abs).toLowerCase()] || 'image/png';
+    if (!isInside(baseDir, abs)) { skipped++; return ''; }
+
+    // 符号链接可以指向任意位置，路径检查通过后还要看真实文件落在哪
+    let real;
+    try { real = fs.realpathSync(abs); } catch { return m; } // 不存在或断链，保持原样
+    if (!isInside(realBase, real)) { skipped++; return ''; }
+
+    let st;
+    try { st = fs.statSync(real); } catch { return m; }
+    if (!st.isFile()) { skipped++; return ''; }
+    if (st.size > MAX_IMAGE_BYTES) { skipped++; return ''; } // 先看大小，避免整读超大文件
+
+    let buf;
+    try { buf = fs.readFileSync(real); } catch { return m; }
+    const info = inspectImage(buf);
+    if (!info.ok) { skipped++; return ''; }
+
     count++;
-    return `<img${pre}src="data:${mime};base64,${fs.readFileSync(abs).toString('base64')}"${post}>`;
+    // MIME 取自魔数而非扩展名：`a.png` 实际是 JPEG 时按 JPEG 标注，避免下游误判
+    return `<img${pre}src="data:${info.mime};base64,${buf.toString('base64')}"${post}>`;
   });
   return { html: out, count, skipped };
 }
@@ -181,4 +220,6 @@ function htmlToPdf(html, outPath, baseDir) {
   }
 }
 
-module.exports = { markdownToHtml, htmlToDocx, htmlToPdf, sanitizeHtml, browserPath, CSS };
+module.exports = {
+  markdownToHtml, htmlToDocx, htmlToPdf, sanitizeHtml, browserPath, inlineImages, CSS,
+};

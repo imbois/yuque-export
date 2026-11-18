@@ -281,17 +281,32 @@ async function readLimited(res) {
  * 按魔数嗅探、不看扩展名。文档内容不可信，攻击者可用假扩展名的恶意格式图片
  * 打挂导出进程，故在下载侧直接拒绝白名单以外的所有格式。
  */
-function looksLikeImage(buf) {
-  if (!Buffer.isBuffer(buf) || buf.length < 12) return false;
+function detectImageType(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 12) return null;
   const ascii = (s, off = 0) => buf.slice(off, off + s.length).toString('latin1') === s;
-  if (ascii('\x89PNG\r\n\x1a\n')) return true; // PNG
-  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return true; // JPEG
-  if (ascii('GIF87a') || ascii('GIF89a')) return true; // GIF
-  if (ascii('RIFF') && ascii('WEBP', 8)) return true; // WebP
-  if (ascii('BM') && buf[2] !== 0) return true; // BMP
+  if (ascii('\x89PNG\r\n\x1a\n')) return 'png';
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpeg';
+  if (ascii('GIF87a') || ascii('GIF89a')) return 'gif';
+  if (ascii('RIFF') && ascii('WEBP', 8)) return 'webp';
+  if (ascii('BM') && buf[2] !== 0) return 'bmp';
+  // SVG 没有二进制魔数，退化为文本前缀判断
   const head = buf.slice(0, 256).toString('utf8').trimStart().toLowerCase();
-  if (head.startsWith('<?xml') || head.startsWith('<svg')) return true; // SVG
-  return false;
+  if (head.startsWith('<?xml') || head.startsWith('<svg')) return 'svg';
+  return null;
+}
+
+/** 魔数类型 → MIME。只映射白名单内的类型，不使用扩展名或响应头。 */
+const IMAGE_MIME = {
+  png: 'image/png',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  bmp: 'image/bmp',
+  svg: 'image/svg+xml',
+};
+
+function looksLikeImage(buf) {
+  return detectImageType(buf) !== null;
 }
 
 /** 下载单张图片，返回 buffer；失败抛错 */
@@ -406,6 +421,9 @@ module.exports = {
   assertPublicTarget,
   safeFetch,
   looksLikeImage,
+  detectImageType,
+  IMAGE_MIME,
+  MAX_IMAGE_BYTES,
   collectImageUrls,
   fetchContext,
   fetchDocBody,

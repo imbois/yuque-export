@@ -143,7 +143,7 @@ async function exportDoc({ ctx, docSlug, docTitle, outDir, opts, referer, stepLa
   const base = mdPath.replace(/\.md$/, '');
   const { html, inlined, skipped } = markdownToHtml(imgs.markdown, outDir);
   if (opts.keepHtml) fs.writeFileSync(base + '.html', html, 'utf8');
-  if (skipped) console.warn(`         ! ${skipped} 张图片路径越界，已跳过（不读取输出目录外的文件）`);
+  if (skipped) console.warn(`         ! ${skipped} 张图片未内嵌（下载失败，或未通过越界/格式/体积校验）`);
 
   const docxPath = base + '.docx';
   const size = await htmlToDocx(html, path.basename(base), docxPath);

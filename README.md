@@ -116,10 +116,11 @@ Markdown 里保留原始链接并在终端给出警告——宁可链接是远�
 | 风险 | 处理方式 |
 |---|---|
 | 登录态泄露 | cookie / Referer **只发给 `*.yuque.com`**，第三方图片域名只带通用 UA |
-| 读取本机其他文件 | 内嵌图片路径必须落在输出目录内，`../` 越界引用一律跳过 |
+| 读取本机其他文件 | 内嵌图片路径必须落在输出目录内，`../` 越界引用一律跳过；路径检查后再用 `realpath` 确认**符号链接的真实目标**仍在目录内 |
 | 借文档探测内网 | 拒绝下载 `localhost` / `10.x` / `172.16-31.x` / `192.168.x` / 链路本地地址；**重定向逐跳复检**，并校验 DNS 解析后的 IP |
-| 资源耗尽 | 单张图片 20MB 上限（流式中断），30 秒超时 |
-| 恶意格式图片 | 只接受 PNG / JPEG / GIF / WebP / BMP / SVG 的**魔数**，拒绝 ICNS、HEIF、JXL 等（防止下游解析器死循环） |
+| 资源耗尽 | 单张图片 20MB 上限（下载时流式中断；本地文件与 `data:` 内联图片按体积先拦截），30 秒超时 |
+| 恶意格式图片 | 只接受 PNG / JPEG / GIF / WebP / BMP / SVG 的**魔数**，拒绝 ICNS、HEIF、JXL 等（防止下游解析器死循环）；网络下载、本地相对路径、文档自带的 `data:` 三条入口走同一套校验 |
+| 下游二次请求 | 下载失败的远程图片在生成 HTML 前移除：`html-to-docx` 与打印 PDF 的浏览器都会**自行请求** `<img src="https://…">`，留着等于绕开上述全部校验。原始链接仍保留在 `.md` 里 |
 | 打印时执行脚本 | 用 `sanitize-html` 白名单过滤原始 HTML（`<script>` / `<iframe>` / `on*` / `javascript:` 均被清除），PDF 以 `--disable-javascript` 打印 |
 | 文件名异常 | 过滤非法字符、避开 Windows 保留设备名（CON/NUL/COM1） |
 
@@ -165,7 +166,7 @@ yuque-export/
 │   ├── convert.js    md → html → docx/pdf
 │   └── fsutil.js     文件工具（命名安全化、路径边界）
 ├── test/
-│   └── smoke.js      20 项离线测试（含本地 Mock HTTP 下载链路）
+│   └── smoke.js      33 项离线测试（含本地 Mock HTTP 下载链路）
 ├── .github/workflows/ci.yml
 ├── package.json
 ├── README.md

@@ -16,7 +16,7 @@ const {
   parseUrl, docUrl, isPrivateHost, isPrivateIp, assertPublicTarget, collectImageUrls,
   cleanLakeSource, downloadImages, urls2name, looksLikeImage,
 } = require('../src/client');
-const { markdownToHtml, htmlToDocx } = require('../src/convert');
+const { markdownToHtml, htmlToDocx, inlineImages } = require('../src/convert');
 const { safeName, isInside } = require('../src/fsutil');
 
 let passed = 0;
@@ -240,6 +240,78 @@ function startServer() {
     assert.strictEqual(skipped, 2, '两张越界图片都应被跳过');
     assert.ok(!html.includes('TOP-SECRET-CONTENT'), '不应把目录外文件内容读进文档');
     fs.unlinkSync(outside);
+  });
+
+  await t('下载失败的远程图片不再交给下游二次请求', () => {
+    const { html, count, skipped } = inlineImages('<img src="https://example.com/a.png">', os.tmpdir());
+    assert.strictEqual(count, 0);
+    assert.strictEqual(skipped, 1);
+    assert.ok(!html.includes('example.com'), '不应把远程 URL 留给 html-to-docx / PDF 自行请求');
+  });
+
+  await t('本地图片按魔数校验，伪装文件不内嵌', () => {
+    const base = tmpDir('magic');
+    fs.writeFileSync(path.join(base, 'fake.png'), '<script>alert(1)</script>');
+    const { html, count, skipped } = inlineImages('<img src="./fake.png">', base);
+    assert.strictEqual(count, 0, '不应内嵌非图片内容');
+    assert.strictEqual(skipped, 1);
+    assert.ok(!/fake\.png/.test(html), '不合格图片应被移除');
+  });
+
+  await t('本地图片 MIME 取自魔数而非扩展名', () => {
+    const base = tmpDir('mime');
+    // JPEG 内容存成 .png：标签应按真实格式标注
+    const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(64, 1)]);
+    fs.writeFileSync(path.join(base, 'wrong.png'), jpeg);
+    const { html, count } = inlineImages('<img src="wrong.png">', base);
+    assert.strictEqual(count, 1);
+    assert.ok(html.includes('src="data:image/jpeg;base64,'), '应按魔数标注 MIME：' + html.slice(0, 80));
+  });
+
+  await t('本地超大图片被跳过（不整读进文档）', () => {
+    const base = tmpDir('big');
+    const big = Buffer.alloc(21 * 1024 * 1024, 0);
+    Buffer.from('89504e470d0a1a0a', 'hex').copy(big);
+    fs.writeFileSync(path.join(base, 'big.png'), big);
+    const { count, skipped, html } = inlineImages('<img src="big.png">', base);
+    assert.strictEqual(count, 0);
+    assert.strictEqual(skipped, 1);
+    assert.ok(!html.includes('base64'));
+  });
+
+  await t('data: 图片同时校验魔数与体积', () => {
+    const ok = 'data:image/png;base64,' + PNG.toString('base64');
+    let r = inlineImages(`<img src="${ok}">`, os.tmpdir());
+    assert.strictEqual(r.skipped, 0, '合法 data 图片应保留');
+
+    const icns = 'data:image/png;base64,' +
+      Buffer.concat([Buffer.from('icns\x00\x00\x00\x10'), PNG]).toString('base64');
+    r = inlineImages(`<img src="${icns}">`, os.tmpdir());
+    assert.strictEqual(r.skipped, 1, 'ICNS 伪装的 data 图片应被移除');
+
+    // 超过 20MB 的 base64 载荷：先按长度折算拦截，不解码进内存
+    const huge = 'data:image/png;base64,' + 'A'.repeat(28 * 1024 * 1024);
+    r = inlineImages(`<img src="${huge}">`, os.tmpdir());
+    assert.strictEqual(r.skipped, 1, '超限 data 图片应被移除');
+  });
+
+  await t('符号链接指向输出目录外时拒绝内嵌', () => {
+    const base = tmpDir('link');
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'yq-outside-'));
+    fs.writeFileSync(path.join(outsideDir, 'secret.png'), PNG);
+    const link = path.join(base, 'pkg');
+    try {
+      // Windows 建文件符号链接需要管理员权限，目录 junction 不需要；两者都能绕过路径检查
+      fs.symlinkSync(outsideDir, link, process.platform === 'win32' ? 'junction' : 'dir');
+    } catch {
+      console.log('  skip 符号链接测试（当前平台/权限不支持创建链接）');
+      return;
+    }
+    const { count, skipped } = inlineImages('<img src="pkg/secret.png">', base);
+    assert.strictEqual(count, 0, '不应读取链接指向的目录外文件');
+    assert.strictEqual(skipped, 1);
+    fs.unlinkSync(link);
+    fs.rmSync(outsideDir, { recursive: true, force: true });
   });
 
   await t('生成 docx（离线）', async () => {
