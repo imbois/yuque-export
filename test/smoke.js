@@ -314,6 +314,70 @@ function startServer() {
     fs.rmSync(outsideDir, { recursive: true, force: true });
   });
 
+  // ---------- CLI：参数、退出码与结果报告 ----------
+  const cli = require('../src/cli');
+  const { spawnSync } = require('child_process');
+  const cliPath = path.join(__dirname, '..', 'src', 'cli.js');
+
+  await t('cli.js 可被 require 且不触发主流程', () => {
+    assert.strictEqual(typeof cli.buildReport, 'function');
+    assert.strictEqual(typeof cli.UsageError, 'function');
+  });
+
+  await t('--report 解析：无值用默认名，带值用指定路径', () => {
+    assert.strictEqual(cli.parseArgs(['--report']).report, true);
+    const b = cli.parseArgs(['--report', 'r.json', '--pdf']);
+    assert.strictEqual(b.report, 'r.json');
+    assert.strictEqual(b.pdf, true);
+    const c = cli.parseArgs(['--report', '--pdf']);
+    assert.strictEqual(c.report, true, '下一个参数是选项时应视为无值');
+    assert.strictEqual(c.pdf, true);
+    assert.strictEqual(cli.reportPathOf({ report: true }, '/tmp/out'),
+      path.resolve('/tmp/out', 'yuque-export-report.json'));
+    assert.strictEqual(cli.reportPathOf({ report: 'r.json' }, '/tmp/out'),
+      path.resolve('/tmp/out', 'r.json'));
+    assert.strictEqual(cli.reportPathOf({ report: null }, '/tmp/out'), null);
+  });
+
+  await t('--limit 非法抛 UsageError（退出码 2 的来源）', () => {
+    assert.throws(() => cli.readLimit({ limitRaw: 'abc' }), cli.UsageError);
+    assert.throws(() => cli.readLimit({ limitRaw: '-1' }), cli.UsageError);
+    assert.throws(() => cli.readLimit({ limitRaw: '0' }), cli.UsageError);
+    assert.strictEqual(cli.readLimit({ limitRaw: '5' }), 5);
+    assert.strictEqual(cli.readLimit({ limitRaw: null }), 0);
+  });
+
+  await t('buildReport 汇总成功/失败/警告与 ok 标记', () => {
+    const r = cli.buildReport({
+      version: '9.9.9',
+      startedAt: new Date(0),
+      finishedAt: new Date(1000),
+      items: [
+        { ok: true, warnings: [], files: { md: 'a.md' } },
+        { ok: false, warnings: ['x'], files: {}, error: 'boom' },
+        { ok: true, warnings: ['y', 'z'], files: {} },
+      ],
+    });
+    assert.strictEqual(r.ok, false, '有失败项时 ok 应为 false');
+    assert.strictEqual(r.summary.total, 3);
+    assert.strictEqual(r.summary.succeeded, 2);
+    assert.strictEqual(r.summary.failed, 1);
+    assert.strictEqual(r.summary.warnings, 3);
+    assert.strictEqual(r.version, '9.9.9');
+    assert.strictEqual(r.items[1].error, 'boom');
+  });
+
+  await t('退出码契约：无URL→2 / --help→0 / --limit非法→2 / 非法域名→2', () => {
+    const run = (args) => spawnSync(process.execPath, [cliPath, ...args], {
+      encoding: 'utf8', timeout: 60000, cwd: path.join(__dirname, '..'),
+    });
+    assert.strictEqual(run([]).status, 2, '无 URL 应退出 2');
+    assert.strictEqual(run(['--help']).status, 0);
+    assert.strictEqual(run(['--version']).status, 0);
+    assert.strictEqual(run(['--limit', 'abc', 'https://www.yuque.com/u/b/d']).status, 2);
+    assert.strictEqual(run(['https://evilyuque.com/a/b/c']).status, 2, '非法域名属于用法错误');
+  });
+
   await t('生成 docx（离线）', async () => {
     const dir = tmpDir('docx');
     const { html } = markdownToHtml('# 标题\n\n| a | b |\n|---|---|\n| 1 | 2 |', dir);

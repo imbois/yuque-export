@@ -65,7 +65,24 @@ yuque-export "https://www.yuque.com/user/book/任一公开文档" --book --limit
 | `-t, --token <值>` | 私有文档需要的语雀 cookie；也可用环境变量 `YUQUE_COOKIE` |
 | `--book` | 整本导出（默认关闭） |
 | `--limit <n>` | 配合 `--book`，只导出前 n 篇（正整数） |
+| `--report [路径]` | 导出结束后写 JSON 结果报告，默认写到输出目录的 `yuque-export-report.json` |
 | `-h, --help` | 帮助 |
+
+### 退出码与结果报告（脚本 / Agent 判断用）
+
+| 退出码 | 含义 |
+|---|---|
+| `0` | 全部成功 |
+| `1` | 导出失败：网络 / 权限 / 要求的产物未生成（如 `--pdf` 但本机没有浏览器）。重试可能有用 |
+| `2` | 用法或参数错误：URL 不合法、`--limit` 非法、知识库链接未加 `--book` 等。重试无意义 |
+
+`--report` 输出的 JSON 里，顶层 `summary` 给出 `total / succeeded / failed / warnings`，
+每个 `items[]` 条目带 `url`、`title`、`ok`、`files`（md/docx/pdf/html 相对路径）、
+`images`（下载成功与失败清单）和 `warnings`。判断规则：
+
+- 图片下载失败只记入 `warnings`（Markdown 保留原始链接），**不算失败**；
+- `--pdf` 要求了但没生成，**算失败**（退出码 1）；
+- Agent / 定时任务请以 `exit code` + 报告文件为准，不要解析终端文本。
 
 ## 输出结构
 

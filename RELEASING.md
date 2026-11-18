@@ -84,6 +84,7 @@ Trusted Publishing 会自动附带 **provenance**（构建来源证明），可�
 | `ENEEDAUTH` / `Unable to authenticate` | Trusted Publisher 配置与工作流不匹配 | 见第 8 节，逐字核对仓库名、workflow 文件名、是否勾选 direct publish |
 | `403 ... not authorized to publish` | npm 端没允许 `npm publish`（只允许 staged publish） | npm 包设置里勾选允许直接发布 |
 | `npm CLI 版本过低` | 运行环境 npm < 11.5.1 | 工作流里已有 `npm install -g npm@11`，一般不会出现 |
+| 「复核发布结果」步骤报 `404 No match found for version X` | npm publish 已成功，但 registry 处理新版本有几分钟延迟——**误报失败，不是发布失败** | 新版工作流已内置 20 次 × 15 秒重试；旧日志遇到时先用 `npm view yuque-export@X version` 核实，查得到就忽略红叉。**不要 Re-run**（重复发布只会再失败一次） |
 | `E409` / 版本冲突 | 同一版本被并发或重复发布 | 提升版本号 |
 
 失败后修好可以直接在 Actions 页面点 **Re-run jobs**（标签没变，OIDC 身份也不变）；也可以删标签重推。**不要**用 `npm publish --force` 之类的绕过手段——npm 本身也不允许覆盖已发布版本。

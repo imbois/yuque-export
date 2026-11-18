@@ -6,6 +6,11 @@ process.noDeprecation = true; // 屏蔽依赖库的 punycode 弃用告警
  *
  * 默认只导出你指定的那一篇，不会遍历它所在的知识库。
  * 需要整本时才加 --book。
+ *
+ * 退出码（无人值守 / Agent 判断依据）：
+ *   0  全部成功
+ *   1  导出失败（网络 / 权限 / 生成失败等，重试可能有用）
+ *   2  用法或参数错误（URL 不合法、--limit 非法等，重试无意义）
  */
 const fs = require('fs');
 const path = require('path');
@@ -18,6 +23,9 @@ const { markdownToHtml, htmlToDocx, htmlToPdf } = require('./convert');
 const VERSION = require('../package.json').version;
 
 const MIN_NODE_MAJOR = 18;
+
+/** 用法/参数错误：本地就能判定，重试无意义，退出码 2 */
+class UsageError extends Error {}
 
 /** 低于最低版本时给出可读提示，而不是 "fetch is not defined" */
 function assertNode() {
@@ -35,7 +43,7 @@ function assertNode() {
 function parseArgs(argv) {
   const o = {
     out: 'output', pdf: false, keepHtml: false, token: null, url: null,
-    book: false, limitRaw: null, mdOnly: false,
+    book: false, limitRaw: null, mdOnly: false, report: null,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -48,6 +56,12 @@ function parseArgs(argv) {
     else if (a === '--book') o.book = true;
     else if (a === '--md-only') o.mdOnly = true;
     else if (a === '--limit') o.limitRaw = argv[++i];
+    else if (a === '--report') {
+      // --report [路径]：省略路径时写到输出目录的默认文件名
+      const next = argv[i + 1];
+      if (next && !next.startsWith('-')) { o.report = next; i++; }
+      else o.report = true;
+    }
     else if (!a.startsWith('-')) o.url = a;
   }
   // cookie 也可以从环境变量读，避免出现在 shell 历史和进程列表里
@@ -73,13 +87,20 @@ yuque-export v${VERSION} —— 语雀公开文档导出为 Markdown / Word / PD
                       也可用环境变量 YUQUE_COOKIE，避免留在 shell 历史里
   --book              导出整本知识库（默认关闭）
   --limit <n>         配合 --book，最多导出前 n 篇（正整数）
+  --report [路径]     导出结束后写一份 JSON 结果报告（供脚本/Agent 判断，
+                      默认路径：输出目录下 yuque-export-report.json）
   -h, --help          显示帮助
   -v, --version       显示版本号
+
+退出码：
+  0  全部成功
+  1  导出失败（网络 / 权限 / 生成失败等）
+  2  用法或参数错误
 
 示例：
   yuque-export "https://www.yuque.com/user/book/doc"
   yuque-export "https://www.yuque.com/user/book/doc" --pdf -o ./notes
-  yuque-export "https://www.yuque.com/user/book" --book --limit 5
+  yuque-export "https://www.yuque.com/user/book" --book --limit 5 --report
 `);
 }
 
@@ -114,22 +135,54 @@ function readLimit(opts) {
   if (opts.limitRaw === null) return 0;
   const n = Number(opts.limitRaw);
   if (!Number.isInteger(n) || n <= 0) {
-    throw new Error(`--limit 需要正整数，收到 "${opts.limitRaw}"`);
+    throw new UsageError(`--limit 需要正整数，收到 "${opts.limitRaw}"`);
   }
   return n;
 }
 
-/** 导出单篇：下载正文+图片，写 md，转 docx/pdf */
-async function exportDoc({ ctx, docSlug, docTitle, outDir, opts, referer, stepLabel }) {
+/** 报告文件路径：--report 无值时用输出目录下的默认文件名 */
+function reportPathOf(opts, outDir) {
+  if (!opts.report) return null;
+  const name = opts.report === true ? 'yuque-export-report.json' : opts.report;
+  return path.resolve(outDir, name);
+}
+
+/** JSON 里的路径统一用 /，Windows 下也可移植 */
+function relPath(outDir, p) {
+  return path.relative(outDir, p).replace(/\\/g, '/');
+}
+
+/**
+ * 导出单篇：下载正文+图片，写 md，转 docx/pdf。
+ * 不再直接抛错，而是返回结构化结果；致命失败（取正文等）由调用方捕获后
+ * 组装失败条目，保证整本模式能继续、报告能覆盖每一篇。
+ *
+ * 返回：{ url, title, ok, files:{md,docx,pdf,html}, images:{downloaded,failed}, warnings, error? }
+ */
+async function exportDoc({ ctx, docSlug, docTitle, url, outDir, opts, referer, stepLabel }) {
+  const item = {
+    url,
+    title: docTitle || docSlug,
+    ok: false,
+    files: {},
+    images: { downloaded: 0, failed: [] },
+    warnings: [],
+  };
   const body = await fetchDocBody(
     { bookId: ctx.bookId, docSlug, docTitle }, opts.token, referer
   );
+  item.title = body.title || docTitle || docSlug;
+
   const md = cleanLakeSource(body.markdown);
   const imgs = await downloadImages(md, ctx.docId || docSlug, referer, opts.token, path.join(outDir, 'img'));
+  item.images.downloaded = imgs.count;
+  item.images.failed = imgs.failed;
+  if (imgs.failed.length) item.warnings.push(`${imgs.failed.length} 张图片下载失败，已保留原始链接`);
 
-  const title = safeName(body.title || docTitle || 'untitled');
+  const title = safeName(item.title);
   const mdPath = uniquePath(outDir, title + '.md');
   fs.writeFileSync(mdPath, imgs.markdown, 'utf8');
+  item.files.md = relPath(outDir, mdPath);
   log(stepLabel, `md   : ${path.basename(mdPath)}`);
 
   if (imgs.count) log(stepLabel, `图片 : ${imgs.count} 张已下载`);
@@ -138,113 +191,210 @@ async function exportDoc({ ctx, docSlug, docTitle, outDir, opts, referer, stepLa
     imgs.failed.slice(0, 3).forEach((f) => console.warn('           ' + f));
   }
 
-  if (opts.mdOnly) return mdPath;
+  if (opts.mdOnly) {
+    item.ok = true;
+    return item;
+  }
 
   const base = mdPath.replace(/\.md$/, '');
   const { html, inlined, skipped } = markdownToHtml(imgs.markdown, outDir);
-  if (opts.keepHtml) fs.writeFileSync(base + '.html', html, 'utf8');
-  if (skipped) console.warn(`         ! ${skipped} 张图片未内嵌（下载失败，或未通过越界/格式/体积校验）`);
+  if (opts.keepHtml) {
+    fs.writeFileSync(base + '.html', html, 'utf8');
+    item.files.html = relPath(outDir, base + '.html');
+  }
+  if (skipped) item.warnings.push(`${skipped} 张图片未内嵌（下载失败，或未通过越界/格式/体积校验）`);
 
   const docxPath = base + '.docx';
   const size = await htmlToDocx(html, path.basename(base), docxPath);
+  item.files.docx = relPath(outDir, docxPath);
   log(stepLabel, `docx : ${path.basename(docxPath)} (${Math.round(size / 1024)}KB, 内嵌图片 ${inlined} 张)`);
 
   if (opts.pdf) {
     const r = htmlToPdf(html, base + '.pdf', outDir);
-    log(stepLabel, r.ok ? `pdf  : ${path.basename(base)}.pdf` : `pdf  : 跳过（${r.reason}）`);
+    if (r.ok) {
+      item.files.pdf = relPath(outDir, base + '.pdf');
+      log(stepLabel, `pdf  : ${path.basename(base)}.pdf`);
+    } else {
+      // 用户明确要求了 PDF 就要如实报告：算失败，退出码 1
+      item.ok = false;
+      item.error = `PDF 未生成：${r.reason}`;
+      log(stepLabel, `pdf  : 失败（${r.reason}）`);
+      return item;
+    }
   }
-  return docxPath;
+  item.ok = true;
+  return item;
+}
+
+/** 失败条目：整本模式某篇抛错时组装，保证报告覆盖每一篇 */
+function failedItem(url, title, err) {
+  const item = {
+    url, title: title || url, ok: false,
+    files: {}, images: { downloaded: 0, failed: [] }, warnings: [],
+    error: err.message,
+  };
+  if (/HTTP 40[134]/.test(err.message)) {
+    item.warnings.push('该篇未公开或需要登录权限；可加 -t 传 cookie');
+  }
+  return item;
+}
+
+/** 汇总结果报告（--report 的 JSON 结构，Agent/脚本以此判断结果） */
+function buildReport({ version, startedAt, finishedAt, items }) {
+  const succeeded = items.filter((x) => x.ok).length;
+  const failed = items.length - succeeded;
+  return {
+    tool: 'yuque-export',
+    version,
+    startedAt: startedAt.toISOString(),
+    finishedAt: finishedAt.toISOString(),
+    ok: failed === 0 && items.length > 0,
+    summary: {
+      total: items.length,
+      succeeded,
+      failed,
+      warnings: items.reduce((n, x) => n + x.warnings.length, 0),
+    },
+    items,
+  };
+}
+
+function writeReport(reportPath, report) {
+  fs.writeFileSync(reportPath, JSON.stringify(report, null, 2) + '\n', 'utf8');
 }
 
 async function main() {
   assertNode();
+  const startedAt = new Date();
   const opts = parseArgs(process.argv.slice(2));
   if (opts.version) return console.log(VERSION);
-  // 显式 -h/--help 视为正常退出（exit 0），没给 URL 才是用法错误（exit 1）
+  // 显式 -h/--help 视为正常退出（exit 0），没给 URL 才是用法错误（exit 2）
   if (opts.help) { help(); process.exit(0); }
-  if (!opts.url) { help(); process.exit(1); }
+  if (!opts.url) { help(); process.exit(2); }
 
-  const limit = readLimit(opts);
-  const parts = parseUrl(opts.url);
+  const limit = readLimit(opts); // 用法错误 → UsageError → exit 2
+  let parts;
+  try {
+    parts = parseUrl(opts.url);
+  } catch (e) {
+    throw new UsageError(e.message);
+  }
   checkDeps();
 
   const outDir = path.resolve(opts.out);
   await ensureDir(outDir);
+  const items = [];
 
   if (!opts.book) {
     if (!parts.docSlug) {
-      throw new Error('这是一个知识库链接。若要整本导出请加 --book；否则请给出具体文档链接。');
+      throw new UsageError('这是一个知识库链接。若要整本导出请加 --book；否则请给出具体文档链接。');
     }
     log('1/2', `读取文档：${parts.docSlug}`);
-    const ctx = await fetchContext(parts.canonical, opts.token);
-    if (!ctx.docSlug) throw new Error('页面中未找到文档信息，可能是知识库首页；单篇导出请使用具体文档链接。');
-    ctx.docId = ctx.docId || ctx.docSlug;
-    log('2/2', `生成文件到 ${outDir}`);
-    // Referer 用 login/book/doc 完整拼装，而不是在入口 URL 后追加
-    const referer = docUrl(parts.login, parts.bookSlug, ctx.docSlug);
-    await exportDoc({ ctx, docSlug: ctx.docSlug, docTitle: ctx.docTitle, outDir, opts, referer, stepLabel: '  →' });
-    console.log('\n完成。');
-    return;
-  }
-
-  // 整本模式（显式 --book 才会走这里）
-  log('1/3', `读取知识库：${parts.login}/${parts.bookSlug}`);
-  let ctx;
-  try {
-    ctx = await fetchContext(parts.canonical, opts.token);
-  } catch (e) {
-    throw new Error(
-      '读取知识库失败：' + e.message +
-      '\n提示：部分语雀知识库的首页不公开，请改用库内任意一篇公开文档的链接加 --book。'
-    );
-  }
-  if (!ctx.toc.length) throw new Error('未读取到目录。该知识库可能不公开，请用 -t 传入 cookie。');
-
-  const docs = ctx.toc.filter((t) => t.type === 'DOC' && t.visible !== false && t.url);
-  const list = limit > 0 ? docs.slice(0, limit) : docs;
-  const bookDir = path.join(outDir, safeName(ctx.bookName || parts.bookSlug));
-  await ensureDir(bookDir);
-
-  log('2/3', `目录 ${docs.length} 篇` + (limit ? `，本次处理前 ${list.length} 篇` : ''));
-
-  const index = [];
-  let ok = 0;
-  for (let i = 0; i < list.length; i++) {
-    const item = list[i];
-    const label = `  (${i + 1}/${list.length})`;
+    let ctx = null;
     try {
-      // 每篇的 Referer 都要按 login/book/doc 重新拼，避免叠成 …/doc1/doc2
-      const referer = docUrl(parts.login, parts.bookSlug, item.url);
-      const body = await fetchDocBody({ bookId: ctx.bookId, docSlug: item.url, docTitle: item.title }, opts.token, referer);
-      const md = cleanLakeSource(body.markdown);
-      const imgs = await downloadImages(md, item.uuid || item.url, referer, opts.token, path.join(bookDir, 'img'));
-      const mdPath = uniquePath(bookDir, safeName(body.title || item.title) + '.md');
-      fs.writeFileSync(mdPath, imgs.markdown, 'utf8');
-      log('   ', `${label} ${path.basename(mdPath)}`);
-
-      if (!opts.mdOnly) {
-        const base = mdPath.replace(/\.md$/, '');
-        const { html } = markdownToHtml(imgs.markdown, bookDir);
-        if (opts.keepHtml) fs.writeFileSync(base + '.html', html, 'utf8');
-        await htmlToDocx(html, path.basename(base), base + '.docx');
-        if (opts.pdf) htmlToPdf(html, base + '.pdf', bookDir);
-      }
-      index.push({ title: body.title || item.title, file: path.basename(mdPath) });
-      ok++;
+      ctx = await fetchContext(parts.canonical, opts.token);
+      if (!ctx.docSlug) throw new Error('页面中未找到文档信息，可能是知识库首页；单篇导出请使用具体文档链接。');
+      ctx.docId = ctx.docId || ctx.docSlug;
+      log('2/2', `生成文件到 ${outDir}`);
+      // Referer 用 login/book/doc 完整拼装，而不是在入口 URL 后追加
+      const referer = docUrl(parts.login, parts.bookSlug, ctx.docSlug);
+      items.push(await exportDoc({
+        ctx, docSlug: ctx.docSlug, docTitle: ctx.docTitle,
+        url: parts.canonical, outDir, opts, referer, stepLabel: '  →',
+      }));
     } catch (e) {
-      const hint = /HTTP 40[134]/.test(e.message) ? '（该篇未公开，需登录权限；可加 -t 传 cookie）' : '';
-      console.warn(`    ${label} 跳过：${e.message}${hint}`);
+      // 读取或导出失败都计入报告，保证 --report 覆盖每一次运行
+      console.error('\n失败：' + e.message);
+      if (/HTTP 40[13]/.test(e.message)) console.error('提示：该文档可能需要登录，请用 -t 传入语雀 cookie。');
+      items.push(failedItem(parts.canonical, null, e));
+    }
+  } else {
+    // 整本模式（显式 --book 才会走这里）
+    log('1/3', `读取知识库：${parts.login}/${parts.bookSlug}`);
+    let ctx = null;
+    try {
+      ctx = await fetchContext(parts.canonical, opts.token);
+    } catch (e) {
+      console.error('\n失败：读取知识库失败：' + e.message +
+        '\n提示：部分语雀知识库的首页不公开，请改用库内任意一篇公开文档的链接加 --book。');
+      items.push(failedItem(parts.canonical, parts.bookSlug, e));
+    }
+    if (ctx) {
+      if (!ctx.toc.length) throw new Error('未读取到目录。该知识库可能不公开，请用 -t 传入 cookie。');
+
+    const docs = ctx.toc.filter((t) => t.type === 'DOC' && t.visible !== false && t.url);
+    const list = limit > 0 ? docs.slice(0, limit) : docs;
+    const bookDir = path.join(outDir, safeName(ctx.bookName || parts.bookSlug));
+    await ensureDir(bookDir);
+
+    log('2/3', `目录 ${docs.length} 篇` + (limit ? `，本次处理前 ${list.length} 篇` : ''));
+
+    const index = [];
+    let ok = 0;
+    for (let i = 0; i < list.length; i++) {
+      const item = list[i];
+      const label = `  (${i + 1}/${list.length})`;
+      const url = docUrl(parts.login, parts.bookSlug, item.url);
+      try {
+        // 每篇的 Referer 都要按 login/book/doc 重新拼，避免叠成 …/doc1/doc2
+        const referer = docUrl(parts.login, parts.bookSlug, item.url);
+        const r = await exportDoc({
+          ctx, docSlug: item.url, docTitle: item.title, url,
+          outDir: bookDir, opts, referer, stepLabel: '   ',
+        });
+        items.push(r);
+        if (r.ok) {
+          index.push({ title: r.title, file: r.files.md && path.basename(r.files.md) });
+          ok++;
+        } else {
+          console.warn(`    ${label} 失败：${r.error}`);
+        }
+      } catch (e) {
+        const f = failedItem(url, item.title, e);
+        items.push(f);
+        console.warn(`    ${label} 跳过：${e.message}${f.warnings.length ? '（' + f.warnings[0] + '）' : ''}`);
+      }
+    }
+
+    const indexMd = ['# ' + (ctx.bookName || parts.bookSlug), '', ...index.filter(Boolean).map((x) => `- [${x.title}](${encodeURI(x.file)})`)].join('\n') + '\n';
+    fs.writeFileSync(path.join(bookDir, 'index.md'), indexMd, 'utf8');
+
+    const failed = list.length - ok;
+    log('3/3', `完成 ${ok}/${list.length} 篇` + (failed ? `，失败 ${failed} 篇` : '') + ` → ${bookDir}`);
     }
   }
 
-  const indexMd = ['# ' + (ctx.bookName || parts.bookSlug), '', ...index.map((x) => `- [${x.title}](${encodeURI(x.file)})`)].join('\n') + '\n';
-  fs.writeFileSync(path.join(bookDir, 'index.md'), indexMd, 'utf8');
+  // 汇总与报告
+  const failedCount = items.filter((x) => !x.ok).length;
+  const reportPath = reportPathOf(opts, outDir);
+  if (reportPath) {
+    const report = buildReport({
+      version: VERSION, startedAt, finishedAt: new Date(), items,
+    });
+    writeReport(reportPath, report);
+    log('报告', reportPath);
+  }
 
-  log('3/3', `完成 ${ok}/${list.length} 篇 → ${bookDir}`);
+  if (failedCount) {
+    console.error(`\n结束：成功 ${items.length - failedCount}，失败 ${failedCount}` +
+      (reportPath ? '，详情见报告文件' : '（可加 --report 输出 JSON 详情）'));
+    process.exitCode = 1;
+  } else {
+    console.log(`\n完成：成功 ${items.length}。`);
+    process.exitCode = 0;
+  }
 }
 
-main().catch((e) => {
-  console.error('\n失败：' + e.message);
-  if (/HTTP 40[13]/.test(e.message)) console.error('提示：该文档可能需要登录，请用 -t 传入语雀 cookie。');
-  process.exit(1);
-});
+// 供测试复用；直接运行时才启动主流程
+module.exports = { UsageError, parseArgs, readLimit, buildReport, reportPathOf, exportDoc, failedItem };
+if (require.main === module) {
+  main().catch((e) => {
+    if (e instanceof UsageError) {
+      console.error('\n用法错误：' + e.message);
+      process.exit(2);
+    }
+    console.error('\n失败：' + e.message);
+    if (/HTTP 40[13]/.test(e.message)) console.error('提示：该文档可能需要登录，请用 -t 传入语雀 cookie。');
+    process.exit(1);
+  });
+}

@@ -123,15 +123,23 @@ jobs:
       - name: 发布（OIDC，provenance 自动生成）
         run: npm publish
 
-      - name: 复核发布结果
+      - name: 复核发布结果（registry 处理新版本有延迟，重试等待）
         env:
           TAG_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           VERSION="${TAG_NAME#v}"
-          PUBLISHED="$(npm view "yuque-export@${VERSION}" version)"
-          echo "npm 上已有 yuque-export@${PUBLISHED}"
-          if [ "${PUBLISHED}" != "${VERSION}" ]; then
-            echo "::error::发布后校验失败：期望 ${VERSION}，实际 ${PUBLISHED}"
-            exit 1
-          fi
+          # npm publish 返回成功后，registry 可能还有几分钟的处理窗口，
+          # 立即查询会拿到 404 —— 这是误报失败，不是发布失败，所以要重试
+          for attempt in $(seq 1 20); do
+            if PUBLISHED="$(npm view "yuque-export@${VERSION}" version \
+                 --registry=https://registry.npmjs.org/ --prefer-online 2>/dev/null)" \
+               && [ "${PUBLISHED}" = "${VERSION}" ]; then
+              echo "发布验证成功：yuque-export@${PUBLISHED}"
+              exit 0
+            fi
+            echo "第 ${attempt}/20 次：${VERSION} 尚未在 registry 可查，15 秒后重试"
+            sleep 15
+          done
+          echo "::error::发布命令已成功，但 5 分钟内 registry 仍未可查到 ${VERSION}，请人工到 npm 页面核实"
+          exit 1

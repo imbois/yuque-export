@@ -53,7 +53,23 @@ node src/cli.js "<yuque-url>" [options]
 | `-t, --token <val>` | Yuque cookie value (`_yuque_session`) for private documents; `YUQUE_COOKIE` env var also works and avoids leaving it in shell history |
 | `--book` | Export the whole knowledge base (explicit opt-in) |
 | `--limit <n>` | With `--book`, stop after the first n documents |
+| `--report [path]` | Write a JSON result report after exporting (default path: `<out>/yuque-export-report.json`) — the machine-readable way to check what succeeded |
 | `-h, --help` | Show help |
+
+### Exit codes (how to judge success programmatically)
+
+| Code | Meaning |
+|---|---|
+| `0` | Everything succeeded |
+| `1` | Export failed — network / permission / requested artifact missing (e.g. `--pdf` requested but no browser found). Retry may help |
+| `2` | Usage error — invalid URL, bad `--limit`, knowledge-base URL without `--book`. Retry is pointless, fix the invocation |
+
+For unattended runs or agent workflows, prefer `--report` + exit code over parsing
+stdout. Each item in the report carries `url`, `title`, `ok`, `files` (md/docx/pdf/html
+relative paths), `images` (downloaded / failed lists) and `warnings`; the top-level
+`summary` shows `total / succeeded / failed / warnings`. Images that failed to
+download are recorded in `warnings` (the Markdown keeps their original URL) and do
+**not** fail the run — but a requested PDF that was not produced does.
 
 ### Typical invocations
 
@@ -107,7 +123,7 @@ which is only consulted in `--book` mode.
 | `HTTP 401` / `HTTP 404` on a document | That document is not public. Only publicly shared documents work anonymously. |
 | Book mode reports `读取知识库失败` | Some books have no public home page. Use a public document URL from inside the book with `--book`. |
 | `正文为空` | The document is a special widget (board, mind map, data sheet) with no Markdown body. |
-| PDF skipped | No Chrome/Edge/Chromium found. Drop `--pdf`, keep the `.docx`. |
+| PDF failed | No Chrome/Edge/Chromium found. Drop `--pdf`, keep the `.docx`. Note: with `--pdf` requested but not produced the exit code is 1 and the report item is marked failed. |
 | Images missing | Some CDN images require auth or were deleted; the md keeps the original URL so nothing is silently lost. |
 
 ## Limits
