@@ -149,8 +149,8 @@ Markdown 里保留原始链接并在终端给出警告——宁可链接是远�
 该文档不是公开的。用 `-t` 传 cookie，或找作者要权限。
 
 **Q：图片在 Word 里没显示？**
-看 `img/<docId>/` 是否有对应文件。需要鉴权的 CDN 图片会下载失败，此时 Markdown 与 Word 里
-**都保留原始链接**（终端会打印哪几张失败），联网环境下仍能看到图片。
+看 `img/<docId>/` 是否有对应文件。需要鉴权的 CDN 图片会下载失败（终端会打印是哪几张），Markdown 里**保留原始链接**；
+但 Word/PDF 中该图会被移除 —— `html-to-docx` 与打印 PDF 的浏览器会**自行请求**图片 URL，留着等于绕过下载侧的 SSRF 与格式校验。
 
 **Q：为什么不直接用 pandoc？**
 可以，但 pandoc 出 PDF 要装 LaTeX 并配中文字体。本方案零额外系统依赖。
@@ -160,6 +160,7 @@ Markdown 里保留原始链接并在终端给出警告——宁可链接是远�
 ```
 yuque-export/
 ├── SKILL.md          Agent 技能描述（触发词、用法、排障）
+├── RELEASING.md      发布流程（SemVer、标签触发、OIDC 排障）
 ├── src/
 │   ├── cli.js        命令行入口
 │   ├── client.js     语雀接口客户端（无第三方 SDK）
@@ -167,7 +168,9 @@ yuque-export/
 │   └── fsutil.js     文件工具（命名安全化、路径边界）
 ├── test/
 │   └── smoke.js      33 项离线测试（含本地 Mock HTTP 下载链路）
-├── .github/workflows/ci.yml
+├── .github/workflows/
+│   ├── ci.yml        测试矩阵（push main / PR）
+│   └── publish.yml   v* 标签发布（OIDC）
 ├── package.json
 ├── README.md
 └── LICENSE

@@ -1,0 +1,137 @@
+name: Publish
+
+# 只有推送 v* 标签才会发布；push main 只跑 ci.yml，不碰 npm
+on:
+  push:
+    tags:
+      - 'v*'
+
+# 默认最小权限；publish 作业只额外加 id-token（OIDC 必需）
+permissions:
+  contents: read
+
+# 同一时间只允许一个发布，避免两个标签并发推送时互相抢版本
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: 发布前验证
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 需要完整历史判断标签是否在 main 上
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: 标签版本必须与 package.json 一致
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${TAG_NAME#v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          echo "tag=${TAG_NAME} (${TAG_VERSION}) / package.json=${PKG_VERSION}"
+          if [ "${TAG_VERSION}" != "${PKG_VERSION}" ]; then
+            echo "::error::标签 ${TAG_NAME} 与 package.json 版本 ${PKG_VERSION} 不一致，拒绝发布"
+            exit 1
+          fi
+
+      - name: 标签必须落在 main 分支上
+        env:
+          TAG_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "${TAG_SHA}" refs/remotes/origin/main; then
+            echo "::error::标签所在提交不在 main 上，拒绝发布（请从 main 打标签）"
+            exit 1
+          fi
+
+      - name: 包名与仓库地址检查
+        run: |
+          set -euo pipefail
+          node -e '
+            const p = require("./package.json");
+            const want = "git+https://github.com/imbois/yuque-export.git";
+            if (p.name !== "yuque-export") throw new Error("包名异常: " + p.name);
+            if (!p.repository || p.repository.url !== want) {
+              throw new Error("repository.url 必须与 GitHub 仓库一致（Trusted Publishing 依赖它）: " + want);
+            }
+          '
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 测试
+        run: npm test
+
+      - name: 打包检查
+        run: npm pack --dry-run
+
+      - name: 该版本不能已经存在于 npm
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG_NAME#v}"
+          if npm view "yuque-export@${VERSION}" version >/dev/null 2>&1; then
+            echo "::error::yuque-export@${VERSION} 已存在于 npm，拒绝重复发布。请提升版本号后重新打标签。"
+            exit 1
+          fi
+          echo "yuque-export@${VERSION} 尚未发布，可以继续"
+
+  publish:
+    name: 发布到 npm（OIDC）
+    needs: verify
+    runs-on: ubuntu-latest
+    # 如需人工审批再放行，在 GitHub 建 environment（如 npm-publish），
+    # 这里加 environment: npm-publish，并在 npm 的 Trusted Publisher 里填同名 Environment
+    permissions:
+      contents: read
+      id-token: write # npm Trusted Publishing 用它换取短时 token，无需任何长期 Token
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          # 刻意不配 registry-url：它会写入 _authToken=${NODE_AUTH_TOKEN}，
+          # 而 OIDC 发布不需要、也不该依赖任何 token；也不开依赖缓存
+
+      - name: 确认 npm CLI 满足 Trusted Publishing 要求（>= 11.5.1）
+        run: |
+          set -euo pipefail
+          npm install -g npm@11
+          echo "npm $(npm -v)"
+          node -e '
+            const { execSync } = require("child_process");
+            const v = execSync("npm -v").toString().trim().split(".").map(Number);
+            if (v[0] < 11 || (v[0] === 11 && v[1] < 5)) {
+              console.error("npm CLI 版本过低，Trusted Publishing 需要 >= 11.5.1");
+              process.exit(1);
+            }
+          '
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 发布（OIDC，provenance 自动生成）
+        run: npm publish
+
+      - name: 复核发布结果
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG_NAME#v}"
+          PUBLISHED="$(npm view "yuque-export@${VERSION}" version)"
+          echo "npm 上已有 yuque-export@${PUBLISHED}"
+          if [ "${PUBLISHED}" != "${VERSION}" ]; then
+            echo "::error::发布后校验失败：期望 ${VERSION}，实际 ${PUBLISHED}"
+            exit 1
+          fi
