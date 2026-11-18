@@ -1,7 +1,11 @@
 ---
 name: yuque-export
 description: Export a public Yuque (语雀) document to Markdown, Word (.docx) and PDF with all images embedded, so one file can be shared or imported elsewhere. This skill should be used when the user pastes a yuque.com link and wants it downloaded, backed up, archived, converted to Word or PDF, handed to people who do not use Yuque, or migrated into Obsidian, Typora or a Git repo. Trigger phrases include 下载语雀, 语雀导出, 语雀转 Word, 语雀转 PDF, 保存语雀文档, yuque export, yuque to docx, yuque to pdf.
-agent_created: true
+license: MIT
+metadata:
+  author: imbois
+  npm: yuque-export
+  repository: https://github.com/imbois/yuque-export
 ---
 
 # Yuque Export
