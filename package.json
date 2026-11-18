@@ -1,6 +1,6 @@
 {
   "name": "yuque-export",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "Export a public Yuque (语雀) document to Markdown, Word and PDF with images embedded. No Yuque membership or third-party Yuque SDK required.",
   "main": "src/client.js",
   "bin": {
