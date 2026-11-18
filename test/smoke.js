@@ -13,7 +13,8 @@ const http = require('http');
 process.env.YUQUE_EXPORT_ALLOW_PRIVATE = '1';
 
 const {
-  parseUrl, docUrl, isPrivateHost, collectImageUrls, cleanLakeSource, downloadImages, urls2name,
+  parseUrl, docUrl, isPrivateHost, isPrivateIp, assertPublicTarget, collectImageUrls,
+  cleanLakeSource, downloadImages, urls2name,
 } = require('../src/client');
 const { markdownToHtml, htmlToDocx } = require('../src/convert');
 const { safeName, isInside } = require('../src/fsutil');
@@ -42,7 +43,7 @@ function tmpDir(tag) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `yq-${tag}-`));
 }
 
-/** 本地 Mock：/ok*.png 正常、/bad.png 500、/huge.png 声明超大体积、其余 302 */
+/** 本地 Mock：/ok*.png 正常、/bad.png 500、/huge.png 声明超大、/stream-huge.png 无声明流式超大、/loop 302 自环、其余 302 */
 function startServer() {
   const server = http.createServer((req, res) => {
     if (req.url === '/bad.png') {
@@ -52,6 +53,26 @@ function startServer() {
     if (req.url === '/huge.png') {
       res.writeHead(200, { 'content-type': 'image/png', 'content-length': 21 * 1024 * 1024 });
       return res.end(PNG);
+    }
+    if (req.url === '/stream-huge.png') {
+      // 不声明 content-length，让体积上限只能靠流式读取拦截
+      res.writeHead(200, { 'content-type': 'image/png' });
+      const chunk = Buffer.alloc(64 * 1024, 1);
+      let sent = 0;
+      const total = 21 * 1024 * 1024;
+      const timer = setInterval(() => {
+        sent += chunk.length;
+        if (sent >= total || res.destroyed) {
+          clearInterval(timer);
+          return res.destroyed ? undefined : res.end();
+        }
+        res.write(chunk);
+      }, 1);
+      return;
+    }
+    if (req.url === '/loop') {
+      res.writeHead(302, { location: '/loop' });
+      return res.end();
     }
     if (req.url.startsWith('/ok')) {
       res.writeHead(200, { 'content-type': 'image/png', 'content-length': PNG.length });
@@ -106,6 +127,35 @@ function startServer() {
     assert.ok(!isPrivateHost('cdn.nlark.com'));
   });
 
+  await t('内网 IP 网段识别（含 IPv6 与 CGNAT）', () => {
+    assert.ok(isPrivateIp('127.0.0.1'));
+    assert.ok(isPrivateIp('10.1.2.3'));
+    assert.ok(isPrivateIp('192.168.0.1'));
+    assert.ok(isPrivateIp('172.16.0.1'));
+    assert.ok(isPrivateIp('172.31.255.255'));
+    assert.ok(isPrivateIp('169.254.1.1'));
+    assert.ok(isPrivateIp('100.64.0.1'), 'CGNAT 100.64/10 属保留段');
+    assert.ok(isPrivateIp('::1'));
+    assert.ok(isPrivateIp('fd00::1234'), 'IPv6 unique local');
+    assert.ok(isPrivateIp('fe80::1'), 'IPv6 link local');
+    assert.ok(!isPrivateIp('8.8.8.8'));
+    assert.ok(!isPrivateIp('172.32.0.1'), '172.32 已超出 172.16/12');
+    assert.ok(!isPrivateIp('2001:db8::1'));
+  });
+
+  await t('assertPublicTarget 拒绝内网与非 http 协议', async () => {
+    // 本测试显式关闭放行开关，走生产校验路径
+    process.env.YUQUE_EXPORT_ALLOW_PRIVATE = '0';
+    try {
+      await assert.rejects(() => assertPublicTarget('http://127.0.0.1:9999/x'), /拒绝访问内网地址/);
+      await assert.rejects(() => assertPublicTarget('http://10.0.0.1/x'), /拒绝访问内网地址/);
+      await assert.rejects(() => assertPublicTarget('http://192.168.1.1/x'), /拒绝访问内网地址/);
+      await assert.rejects(() => assertPublicTarget('ftp://example.com/x'), /不支持的协议/);
+    } finally {
+      process.env.YUQUE_EXPORT_ALLOW_PRIVATE = '1';
+    }
+  });
+
   // ---------- 文本处理 ----------
   await t('清洗 font 标签', () => {
     assert.strictEqual(cleanLakeSource('<font color="red">警告</font>\n\n\n\n正文'), '警告\n\n正文');
@@ -147,6 +197,17 @@ function startServer() {
     );
     assert.ok(!/script/i.test(html), '不应残留 script');
     assert.ok(!/onerror/i.test(html), '不应残留事件属性');
+  });
+
+  await t('白名单过滤覆盖不带引号的属性与 javascript: 变体', () => {
+    const { html } = markdownToHtml(
+      '<img src=x.png onerror=alert(1)>\n\n<a href=javascript:alert(2)>点我</a>\n\n<iframe src="//evil.com"></iframe>',
+      process.cwd()
+    );
+    assert.ok(!/onerror/i.test(html), '不带引号的 onerror 应被清除');
+    assert.ok(!/javascript:/i.test(html), '不带引号的 javascript: 应被清除');
+    assert.ok(!/<iframe/i.test(html), 'iframe 应被整体移除');
+    assert.ok(!/evil\.com/i.test(html), 'iframe 内容不应残留');
   });
 
   await t('越界图片引用不被内嵌', () => {
@@ -198,6 +259,20 @@ function startServer() {
       const dir = tmpDir('ct');
       const r = await downloadImages(`![x](${base}/bad.png)`, 'd', '', null, dir);
       assert.strictEqual(r.count, 0);
+    });
+
+    await t('无 content-length 的流式超限被中断', async () => {
+      const dir = tmpDir('stream');
+      const r = await downloadImages(`![x](${base}/stream-huge.png)`, 'd', '', null, dir);
+      assert.strictEqual(r.count, 0);
+      assert.ok(/体积超限/.test(r.failed[0] || ''), '应流式拦截体积超限：' + r.failed[0]);
+    });
+
+    await t('重定向循环被中止', async () => {
+      const dir = tmpDir('loop');
+      const r = await downloadImages(`![x](${base}/loop)`, 'd', '', null, dir);
+      assert.strictEqual(r.count, 0);
+      assert.ok(/重定向超过/.test(r.failed[0] || ''), '应中止重定向循环：' + r.failed[0]);
     });
   } finally {
     server.close();

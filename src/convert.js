@@ -52,14 +52,34 @@ function browserPath() {
 /**
  * 过滤 Markdown 中的原始 HTML：语雀正文可能夹带 <script> / <iframe> /
  * on* 事件属性，生成 HTML 后会交给浏览器打印，必须在之前清掉。
+ *
+ * 用 sanitize-html 做白名单过滤（正则黑名单覆盖不了不带引号的事件属性等变体）：
+ * 只保留 Markdown 渲染需要的标签，属性只放行 src/href 等极少数，方案白名单限定。
  */
+const sanitizeHtmlLib = require('sanitize-html');
+
+const SANITIZE_OPTS = {
+  allowedTags: [
+    ...sanitizeHtmlLib.defaults.allowedTags,
+    'img', // 官方默认白名单刻意不含 img，必须显式放行
+    'input', // GFM 任务列表的 checkbox
+  ],
+  allowedAttributes: {
+    img: ['src', 'alt', 'title', 'width', 'height'],
+    a: ['href', 'name', 'target', 'rel'],
+    input: ['type', 'checked', 'disabled'],
+    th: ['align', 'colspan', 'rowspan'],
+    td: ['align', 'colspan', 'rowspan'],
+  },
+  allowedSchemes: ['http', 'https', 'mailto', 'tel'],
+  allowedSchemesByTag: {
+    img: ['http', 'https', 'data'], // inlineImages 产出的 base64 图需要 data:
+  },
+  allowProtocolRelative: false,
+};
+
 function sanitizeHtml(html) {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<(iframe|object|embed|link|base)[\s\S]*?>/gi, '')
-    .replace(/\son[a-z]+\s*=\s*"[^"]*"/gi, '')
-    .replace(/\son[a-z]+\s*=\s*'[^']*'/gi, '')
-    .replace(/(href|src)\s*=\s*"\s*javascript:[^"]*"/gi, '$1=""');
+  return sanitizeHtmlLib(html, SANITIZE_OPTS);
 }
 
 /**

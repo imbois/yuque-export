@@ -13,6 +13,7 @@
 
 const { join } = require('path');
 const { createHash } = require('crypto');
+const dns = require('dns').promises;
 const { ensureDir, writeFile, safeName } = require('./fsutil');
 
 const UA =
@@ -46,6 +47,80 @@ function allowPrivate() {
   return process.env.YUQUE_EXPORT_ALLOW_PRIVATE === '1';
 }
 
+/** 解析出来的 IP 是否属于内网/保留网段（DNS rebinding 防线的第二道） */
+function isPrivateIp(ip) {
+  const s = String(ip || '').toLowerCase().trim();
+  if (s.includes(':')) {
+    // IPv6
+    if (s === '::1' || s === '::') return true;
+    if (/^f[cd]/.test(s)) return true; // fc00::/7 unique local
+    if (/^fe[89ab]/.test(s)) return true; // fe80::/10 link local
+    return false;
+  }
+  const o = s.split('.').map(Number);
+  if (o.length !== 4 || o.some((n) => !(n >= 0 && n <= 255))) return false;
+  const [a, b] = o;
+  if (a === 127 || a === 10 || a === 0) return true;
+  if (a === 169 && b === 254) return true; // link local
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT 100.64/10
+  return false;
+}
+
+/**
+ * 校验目标地址可以请求：协议受限、主机不是内网、
+ * 且 DNS 解析出的所有 IP 都不在内网/保留网段。
+ */
+async function assertPublicTarget(urlStr) {
+  const u = new URL(urlStr);
+  if (!/^https?:$/.test(u.protocol)) throw new Error('不支持的协议：' + u.protocol);
+  if (allowPrivate()) return u;
+  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (isPrivateHost(host)) throw new Error('拒绝访问内网地址：' + host);
+  let addrs;
+  try {
+    addrs = await dns.lookup(host, { all: true });
+  } catch {
+    throw new Error('域名解析失败：' + host);
+  }
+  for (const a of addrs) {
+    if (isPrivateIp(a.address)) {
+      throw new Error(`域名 ${host} 解析到内网地址 ${a.address}，已拒绝`);
+    }
+  }
+  return u;
+}
+
+const MAX_REDIRECTS = 5;
+const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
+
+/**
+ * 带逐跳安全校验的 fetch：手动跟随重定向，每一跳都重新做协议/内网/DNS 校验，
+ * 并且 cookie/referer 只发给 yuque.com 系域名（跨域跳转一律剥离，防止登录态外带）。
+ */
+async function safeFetch(url, { cookie, referer, timeout = 30000 } = {}) {
+  let current = url;
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    const u = await assertPublicTarget(current);
+    const toYuque = isYuqueHost(u.hostname);
+    const res = await fetch(u, {
+      headers: headers(toYuque ? cookie : null, toYuque ? referer : null),
+      signal: AbortSignal.timeout(timeout),
+      redirect: 'manual',
+    });
+    if (REDIRECT_STATUS.has(res.status)) {
+      const loc = res.headers.get('location');
+      try { await res.body?.cancel(); } catch { /* 释放连接，失败不影响 */ }
+      if (!loc) throw new Error(`重定向缺少 location（HTTP ${res.status}）`);
+      current = new URL(loc, u).href;
+      continue;
+    }
+    return res;
+  }
+  throw new Error(`重定向超过 ${MAX_REDIRECTS} 次，已中止（疑似重定向循环）`);
+}
+
 function headers(cookie, referer) {
   const h = { 'user-agent': UA, accept: '*/*' };
   if (referer) h.referer = referer;
@@ -56,15 +131,9 @@ function headers(cookie, referer) {
 }
 
 async function getText(url, cookie, referer, timeout = 30000) {
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), timeout);
-  try {
-    const res = await fetch(url, { headers: headers(cookie, referer), signal: ac.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} — ${url}`);
-    return await res.text();
-  } finally {
-    clearTimeout(timer);
-  }
+  const res = await safeFetch(url, { cookie, referer, timeout });
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} — ${url}`);
+  return await res.text();
 }
 
 /** 解析页面内嵌的 appData JSON */
@@ -179,32 +248,48 @@ function collectImageUrls(markdown) {
   return urls;
 }
 
+/** 流式读取响应体，边读边检查体积上限（不再先读完整个响应体再判断） */
+async function readLimited(res) {
+  const len = Number(res.headers.get('content-length') || 0);
+  if (len > MAX_IMAGE_BYTES) {
+    throw new Error(`体积超限 ${(len / 1048576).toFixed(1)}MB`);
+  }
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.length;
+      if (total > MAX_IMAGE_BYTES) {
+        throw new Error(`体积超限（流式读取至 ${(total / 1048576).toFixed(1)}MB 时中断）`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try { await reader.cancel(); } catch { /* 释放连接 */ }
+  }
+  return Buffer.concat(chunks);
+}
+
 /** 下载单张图片，返回 buffer；失败抛错 */
 async function fetchImage(url, cookie, referer) {
-  const host = new URL(url).hostname;
-  if (isPrivateHost(host) && !allowPrivate()) {
-    throw new Error('拒绝访问内网地址');
-  }
-  const toYuque = isYuqueHost(host);
-  const res = await fetch(url, {
-    // 安全边界：cookie/referer 只发给 yuque.com 系域名，
-    // 防止文档内嵌的第三方图片地址把用户的登录态带出去
-    headers: headers(toYuque ? cookie : null, toYuque ? referer : null),
-    signal: AbortSignal.timeout(IMAGE_TIMEOUT),
-    redirect: 'follow',
+  // safeFetch 已做逐跳内网/DNS 校验，且 cookie/referer 只发给 yuque.com 系域名
+  const res = await safeFetch(url, {
+    cookie,
+    referer,
+    timeout: IMAGE_TIMEOUT,
   });
   if (!res.ok) throw new Error('HTTP ' + res.status);
 
-  const len = Number(res.headers.get('content-length') || 0);
-  if (len > MAX_IMAGE_BYTES) throw new Error(`体积超限 ${(len / 1048576).toFixed(1)}MB`);
   const ct = String(res.headers.get('content-type') || '').toLowerCase();
   // 常见 CDN 会返回 octet-stream；只要不是明确的 HTML/文本，就按图片处理
   if (ct && !ct.startsWith('image/') && !ct.startsWith('application/octet-stream')) {
     throw new Error('非图片类型 ' + ct);
   }
-  const buf = Buffer.from(await res.arrayBuffer());
+  const buf = await readLimited(res);
   if (!buf.length) throw new Error('空响应');
-  if (buf.length > MAX_IMAGE_BYTES) throw new Error('体积超限');
   return buf;
 }
 
@@ -295,6 +380,9 @@ module.exports = {
   docUrl,
   isYuqueHost,
   isPrivateHost,
+  isPrivateIp,
+  assertPublicTarget,
+  safeFetch,
   collectImageUrls,
   fetchContext,
   fetchDocBody,

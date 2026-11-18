@@ -28,6 +28,14 @@
 - **测试从 8 项扩到 20 项**：新增本地 Mock HTTP 服务器覆盖下载成功/失败/超限/非图片类型、越界引用拦截、XSS 清洗、离线 docx 生成等
 - CI 由 `npm install` 改为 `npm ci`
 
+### 第二轮审查整改（2026-11-18，同为 2.0.1）
+
+- **重定向绕过 SSRF 校验**：图片/页面请求改为 `redirect: 'manual'` 手动逐跳跟随（上限 5 跳），每一跳重新做协议、内网主机名与 **DNS 解析后 IP** 校验，重定向循环直接中止；跨域跳转一律剥离 cookie/referer
+- **正则 sanitize 换为白名单库**：`sanitizeHtml` 由正则黑名单改为 [`sanitize-html`](https://github.com/apostrophecms/sanitize-html) 白名单过滤，覆盖不带引号的事件属性、`javascript:` 变体等正则覆盖不了的情况（新增依赖）
+- **图片体积流式限读**：不再先读完整个响应体再判断，边读边检查 20MB 上限并中断连接，无 `content-length` 的恶意响应同样被拦截
+- **同步 package-lock.json**：lock 顶层版本号已与 package.json 一致（2.0.1）
+- 测试扩到 25 项（新增内网 IP 网段/IPv6、重定向循环、流式超限、无引号属性过滤等）
+
 ## 2.0.0 — 2026-11-17
 
 首个公开版本。完全自研的语雀公开内容客户端（不依赖第三方语雀 SDK）：
